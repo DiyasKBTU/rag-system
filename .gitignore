@@ -1,0 +1,94 @@
+# Корневой .gitignore для всего проекта
+# Субпроекты (rag_service, django-telegrambot) могут иметь свои .gitignore для специфичных правил
+
+# Переменные окружения — НИКОГДА не в git (содержат реальные ключи)
+.env
+.env.local
+.env.*.local
+.env.example  # только если содержит примеры реальных ключей
+
+# Секретные файлы
+service_account.json
+*.key
+*.pem
+*.p12
+credentials.json
+
+# IDE и редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Кэшы
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Логи
+*.log
+logs/
+
+# Бази данных
+*.db
+*.sqlite
+*.sqlite3
+db.sqlite3
+db.sqlite3-journal
+
+# Django
+/staticfiles/
+/media/
+local_settings.py
+
+# OS specific
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Курсорные файлы
+.cursorignore
+.cursorindexingignore
