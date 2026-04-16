@@ -89,6 +89,11 @@ def extract_text(url: str, html: str) -> PageContent:
     ]):
         tag.decompose()
 
+    # ── Inject heading markers BEFORE removing other tags ──────
+    # h2/h3/h4 become "## Heading text" in plain text
+    # This lets the chunker split by sections later
+    _inject_heading_markers(soup)
+
     # ── Remove navigation and structural elements by class ─────
     exact_remove_classes = [
         # Navigation
@@ -270,6 +275,24 @@ def _extract_content_text(soup: BeautifulSoup) -> str:
     return ""
 
 
+def _inject_heading_markers(soup: BeautifulSoup) -> None:
+    """
+    Replace h2/h3/h4 tags with ## markers in the soup tree.
+
+    This is done BEFORE get_text() so that section headings are
+    preserved in the plain text output. The chunker then uses these
+    markers to split text into sections and build rich prefixes like:
+      [История университета > Учебные корпуса]
+
+    We skip very long "headings" (>150 chars) — those are usually
+    decorative elements, not real section titles.
+    """
+    for tag in soup.find_all(["h2", "h3", "h4"]):
+        heading_text = tag.get_text(strip=True)
+        if heading_text and 2 < len(heading_text) < 150:
+            tag.replace_with(f"\n## {heading_text}\n")
+
+
 def _get_title(soup: BeautifulSoup) -> str:
     """Extract clean page title."""
     # Try h1 first (most accurate for WordPress pages)
@@ -294,6 +317,65 @@ def _get_title(soup: BeautifulSoup) -> str:
         return title
 
     return ""
+
+
+def _remove_nav_lines(text: str) -> str:
+    """
+    Удаляет строки которые выглядят как навигационное меню / breadcrumbs.
+
+    Признаки навигационной строки:
+    - Короткая (< 60 символов)
+    - Нет знаков препинания (.!?:;) и цифр
+    - Похожа на заголовок страницы (title case или CAPS)
+
+    Если 4+ подряд идущих строки — все навигационные → весь блок удаляется.
+    Одиночные навигационные строки оставляем (могут быть реальными заголовками).
+    """
+    lines = text.split("\n")
+    result = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Проверяем следующие 4 строки — все навигационные?
+        nav_block = []
+        j = i
+        while j < len(lines) and j < i + 8:
+            l = lines[j].strip()
+            if l and _looks_like_nav_item(l):
+                nav_block.append(j)
+                j += 1
+            elif not l:
+                j += 1  # пустые строки пропускаем при проверке блока
+            else:
+                break
+
+        if len(nav_block) >= 4:
+            # Это навигационный блок — пропускаем все строки до j
+            i = j
+            continue
+
+        result.append(lines[i])
+        i += 1
+
+    return "\n".join(result)
+
+
+def _looks_like_nav_item(line: str) -> bool:
+    """Возвращает True если строка похожа на пункт навигации."""
+    if len(line) > 70:
+        return False
+    # Есть знаки препинания — скорее всего реальный текст
+    if re.search(r"[.!?;]", line):
+        return False
+    # Есть цифры — может быть телефон, год, код
+    if re.search(r"\d{2,}", line):
+        return False
+    # Очень короткая строка без букв
+    if not re.search(r"[а-яёa-zәіңғүұқөһ]{3,}", line, re.IGNORECASE):
+        return False
+    return True
 
 
 def _clean_text(text: str) -> str:
@@ -360,6 +442,9 @@ def _clean_text(text: str) -> str:
 
     # Join: single empty lines become paragraph separators
     result = "\n".join(cleaned)
+
+    # Убираем навигационные блоки (breadcrumbs, меню)
+    result = _remove_nav_lines(result)
 
     # Remove triple+ newlines
     result = re.sub(r"\n{3,}", "\n\n", result)

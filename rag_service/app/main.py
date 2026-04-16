@@ -1,28 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-main.py - FastAPI server for RAG service.
+main.py - FastAPI сервер RAG-сервиса.
 
-Endpoints:
-  POST /search  - Find relevant chunks for a question (called by Django bot)
-  POST /index   - Trigger manual re-indexing of all pages
-  GET  /health  - Health check (is the server alive?)
-  GET  /stats   - How many chunks are stored in Qdrant?
+Эндпоинты:
+  POST /search  — семантический поиск по базе знаний (вызывает бот)
+  POST /index   — запуск переиндексации сайта
+  GET  /health  — проверка что сервер работает
+  GET  /stats   — сколько записей в Qdrant
 
-How Django bot uses this:
-  1. User sends question to Telegram bot
-  2. Django bot calls POST /search with the question
-  3. RAG service returns relevant text chunks
-  4. Django bot sends question + chunks to ChatGPT
-  5. ChatGPT returns answer -> bot sends to user
+Как работает:
+  1. Пользователь пишет вопрос в Telegram
+  2. bot/run.py делает POST /search с вопросом
+  3. RAG-сервис возвращает релевантные фрагменты текста
+  4. bot/run.py передаёт вопрос + фрагменты в ChatGPT
+  5. ChatGPT формирует ответ → бот отправляет пользователю
 
-Security:
-  All endpoints (except /health) require API key in header:
+Безопасность:
+  Все эндпоинты кроме /health требуют заголовок:
   X-API-Key: your_secret_key_from_env
 """
 
 import logging
 import time
 from contextlib import asynccontextmanager
+
+from app.logging_setup import setup_logging
+setup_logging("api")
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
@@ -34,11 +37,6 @@ from app.retrieval.search import search, search_and_format_context
 from app.indexer.storage import get_collection_stats, ensure_collection_exists
 
 
-# ── Logging setup ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -122,7 +120,7 @@ class SearchResultItem(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    """What /search returns to Django bot"""
+    """Ответ /search — возвращается боту"""
     question: str
     context: str                        # Formatted context string for ChatGPT
     results: List[SearchResultItem]     # Raw chunks (for debugging)
@@ -182,24 +180,15 @@ def search_endpoint(
     api_key: str = Depends(verify_api_key),
 ):
     """
-    Main endpoint - semantic search over indexed chunks.
+    Главный эндпоинт — семантический поиск по базе знаний.
 
-    Django bot calls this for every user question.
-    Returns relevant text chunks that get passed to ChatGPT.
+    Бот вызывает его для каждого вопроса пользователя.
+    Возвращает релевантные фрагменты текста для передачи в ChatGPT.
 
-    Example request:
+    Пример запроса:
         POST /search
         Headers: X-API-Key: your_secret_key
         Body: {"question": "Как поступить в КАИУ?"}
-
-    Example response:
-        {
-            "question": "Как поступить в КАИУ?",
-            "context": "[Source: Поступление]\\nДокументы принимаются...",
-            "results": [...],
-            "total_found": 3,
-            "search_time_ms": 145
-        }
     """
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
@@ -269,6 +258,7 @@ def _run_indexing():
     from app.parser.extractor import get_page_content
     from app.parser.chunker import split_into_chunks
     from app.indexer.storage import save_chunks, page_needs_update
+    from app.indexer.question_generator import generate_question_chunks
 
     logger.info("Background indexing started")
 
@@ -303,13 +293,81 @@ def _run_indexing():
             time_module.sleep(settings.REQUEST_DELAY)
             continue
 
-        saved = save_chunks(chunks, content.url, content.content_hash)
+        # Generate question-chunks (same as CLI indexer)
+        question_chunks = generate_question_chunks(chunks)
+
+        all_chunks = chunks + question_chunks
+        saved = save_chunks(all_chunks, content.url, content.content_hash)
         total_pages += 1
         total_chunks += saved
-        logger.info(f"  Saved {saved} chunks for: {content.title or url}")
+        logger.info(f"  Saved {saved} chunks ({len(chunks)} text + {len(question_chunks)} questions) for: {content.title or url}")
 
         if i < len(urls):
             time_module.sleep(settings.REQUEST_DELAY)
+
+    # ── Индексируем Google Docs ───────────────────────────────────
+    # Объединяем одиночный GOOGLE_DOC_ID из .env и список GOOGLE_DOC_IDS
+    all_google_docs = list(settings.GOOGLE_DOC_IDS)
+    if settings.GOOGLE_DOC_ID:
+        all_google_docs.insert(0, {"id": settings.GOOGLE_DOC_ID, "title": ""})
+
+    if all_google_docs:
+        from app.parser.google_docs_reader import read_google_doc
+        import hashlib
+
+        logger.info(f"Indexing {len(all_google_docs)} Google Docs...")
+
+        for doc_cfg in all_google_docs:
+            doc_id = doc_cfg.get("id", "")
+            doc_title = doc_cfg.get("title", "")
+            if not doc_id:
+                continue
+
+            doc = read_google_doc(
+                doc_id=doc_id,
+                title=doc_title,
+                service_account_file=settings.GOOGLE_SERVICE_ACCOUNT_FILE,
+            )
+            if not doc:
+                logger.warning(f"  Skipped Google Doc (could not read): {doc_id}")
+                continue
+
+            content_hash = hashlib.md5(doc.text.encode()).hexdigest()
+
+            # Skip if document hasn't changed (same as website pages)
+            if not page_needs_update(doc.source_url, content_hash):
+                logger.info(f"  Skipped Google Doc (not changed): {doc.title or doc_id}")
+                continue
+
+            chunks = split_into_chunks(
+                text=doc.text,
+                page_url=doc.source_url,
+                page_title=doc.title,
+            )
+            if not chunks:
+                logger.warning(f"  Skipped Google Doc (no chunks): {doc.title or doc_id}")
+                continue
+
+            # Generate question-chunks (same as website pages — was missing before!)
+            question_chunks = generate_question_chunks(chunks)
+
+            all_doc_chunks = chunks + question_chunks
+            saved = save_chunks(all_doc_chunks, doc.source_url, content_hash)
+            total_chunks += saved
+            logger.info(
+                f"  Google Doc '{doc.title}': "
+                f"chunks={len(chunks)}, questions={len(question_chunks)}, saved={saved}"
+            )
+
+    # ── Строим сводные каталог-чанки ─────────────────────────────────
+    # Синтетические чанки со ВСЕМИ специальностями и факультетами.
+    # Решает проблему неполных ответов на «какие специальности».
+    try:
+        from app.indexer.catalog_builder import build_and_save_catalog_chunks
+        catalog_saved = build_and_save_catalog_chunks()
+        logger.info(f"Catalog chunks saved: {catalog_saved}")
+    except Exception as e:
+        logger.warning(f"Catalog build failed (non-critical): {e}")
 
     stats = get_collection_stats()
     logger.info(

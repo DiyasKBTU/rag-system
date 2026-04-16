@@ -31,10 +31,13 @@ from app.config import settings
 @dataclass
 class TextChunk:
     """One text chunk ready for indexing."""
-    text: str        # chunk text (with title prefix)
-    index: int       # chunk number on this page (0, 1, 2, ...)
-    page_url: str    # URL of the source page
-    page_title: str  # Title of the source page
+    text: str          # text stored in Qdrant and returned to GPT as context
+    index: int         # chunk number on this page (0, 1, 2, ...)
+    page_url: str      # URL of the source page
+    page_title: str    # Title of the source page
+    section_title: str = ""  # Section heading within the page (h2/h3/h4)
+    embed_text: str = ""     # Text used for embedding (empty = use text).
+                             # For question-chunks: embed_text=question, text=original chunk.
 
 
 def split_into_chunks(
@@ -43,57 +46,113 @@ def split_into_chunks(
     page_title: str = "",
 ) -> List[TextChunk]:
     """
-    Split page text into chunks.
+    Split page text into chunks, respecting section boundaries.
 
-    Returns a list of TextChunk objects.
-    Each chunk is sized around CHUNK_SIZE words with CHUNK_OVERLAP overlap.
-    Each chunk is prefixed with the page title for better search recall.
+    Strategy:
+    1. Split by ## markers (h2/h3/h4 headings injected by extractor)
+    2. Within each section, split by word count (CHUNK_SIZE)
+    3. Add overlap between chunks within the same section
+    4. Prefix: [Page Title > Section] or just [Page Title]
+
+    This way chunks stay topically focused — a chunk about "Учебные корпуса"
+    will have that section title in its prefix, making it findable even
+    when the chunk body text is just facts and numbers.
     """
     if not text or len(text.strip()) < 10:
         return []
 
-    # ── Step 1: Split text into paragraphs ───────────────────────
-    paragraphs = _split_into_paragraphs(text)
-
-    if not paragraphs:
-        return []
-
-    # ── Step 2: Group paragraphs into chunks ─────────────────────
-    raw_chunks = _group_paragraphs(paragraphs)
-
-    if not raw_chunks:
-        return []
-
-    # ── Step 3: Add overlap between chunks ───────────────────────
-    chunks_with_overlap = _add_overlap(raw_chunks)
-
-    # ── Step 4: Add title prefix + wrap into TextChunk objects ───
     result = []
-    for i, chunk_text in enumerate(chunks_with_overlap):
-        chunk_text = chunk_text.strip()
+    chunk_index = 0
 
-        # Skip truly empty or trivially short chunks
-        if len(chunk_text) < 20:
+    # ── Step 1: Split text into sections by ## markers ───────────
+    sections = _split_into_sections(text)
+
+    for section_title, section_text in sections:
+        if not section_text.strip():
             continue
 
-        # Prepend page title to each chunk.
-        # This ensures that even if a chunk doesn't repeat the page topic word,
-        # the embedding still captures the topic (e.g. "Общежитие").
-        # We only add the prefix if the title isn't already at the start of the chunk.
-        if page_title:
-            title_lower = page_title.lower()
-            chunk_start = chunk_text[:len(page_title) + 10].lower()
-            if title_lower not in chunk_start:
-                chunk_text = f"[{page_title}]\n{chunk_text}"
+        # ── Step 2: Split section into paragraphs ────────────────
+        paragraphs = _split_into_paragraphs(section_text)
+        if not paragraphs:
+            continue
 
-        result.append(TextChunk(
-            text=chunk_text,
-            index=i,
-            page_url=page_url,
-            page_title=page_title,
-        ))
+        # ── Step 3: Group paragraphs into word-count chunks ──────
+        raw_chunks = _group_paragraphs(paragraphs)
+        if not raw_chunks:
+            continue
+
+        # ── Step 4: Add overlap within this section ───────────────
+        chunks_with_overlap = _add_overlap(raw_chunks)
+
+        # ── Step 5: Build prefix and wrap into TextChunk ─────────
+        for chunk_text in chunks_with_overlap:
+            chunk_text = chunk_text.strip()
+
+            if len(chunk_text) < 20:
+                continue
+
+            # Build prefix: [Page > Section] or [Page]
+            if page_title and section_title:
+                prefix = f"[{page_title} > {section_title}]"
+            elif page_title:
+                prefix = f"[{page_title}]"
+            else:
+                prefix = ""
+
+            if prefix and not chunk_text.lower().startswith(prefix.lower()):
+                chunk_text = f"{prefix}\n{chunk_text}"
+
+            result.append(TextChunk(
+                text=chunk_text,
+                index=chunk_index,
+                page_url=page_url,
+                page_title=page_title,
+                section_title=section_title,
+            ))
+            chunk_index += 1
 
     return result
+
+
+def _split_into_sections(text: str) -> List[tuple]:
+    """
+    Split text into (section_title, section_text) pairs.
+
+    Uses ## markers injected by extractor._inject_heading_markers().
+
+    Example input:
+        "Intro text\n\n## Учебные корпуса\nКорпус А по адресу...\n## Общежитие\n..."
+
+    Example output:
+        [("", "Intro text"), ("Учебные корпуса", "Корпус А по адресу..."), ...]
+
+    If no ## markers exist, returns the whole text as one section with empty title.
+    """
+    sections: List[tuple] = []
+    current_title = ""
+    current_lines: List[str] = []
+
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            # Save accumulated text as previous section
+            section_text = "\n".join(current_lines).strip()
+            if section_text:
+                sections.append((current_title, section_text))
+            current_title = line[3:].strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    # Save the last section
+    section_text = "\n".join(current_lines).strip()
+    if section_text:
+        sections.append((current_title, section_text))
+
+    # If nothing was parsed, return whole text as one unnamed section
+    if not sections:
+        return [("", text)]
+
+    return sections
 
 
 def _split_into_paragraphs(text: str) -> List[str]:

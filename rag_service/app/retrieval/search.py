@@ -2,13 +2,16 @@
 """
 search.py - Semantic search over indexed chunks in Qdrant.
 
-Senior-level RAG retrieval with:
+RAG retrieval:
   - Query preprocessing (normalization + case handling)
   - Query Expansion with university-specific synonym dictionaries
-  - Multi-query search (run expanded queries, merge & deduplicate)
-  - Relative score gap filtering (drop irrelevant tail chunks)
+  - Multi-query semantic search (run expanded queries, merge & deduplicate)
+  - Score gap filtering (drop irrelevant tail chunks)
   - Max context size cap (prevent context bloat to ChatGPT)
   - Source deduplication (don't flood context with same-page chunks)
+
+Note: BM25 keyword search was removed — question-chunk indexing at ingestion
+time provides better recall than runtime keyword matching.
 """
 
 import re
@@ -175,6 +178,9 @@ SYNONYM_MAP: Dict[str, List[str]] = {
         "государственный грант",
         "грантовое финансирование",
         "образовательный грант",
+        "мемлекеттік грант",
+        "оқу гранты",
+        "гранттар",
     ],
     "гранты": [
         "грант на обучение",
@@ -192,6 +198,9 @@ SYNONYM_MAP: Dict[str, List[str]] = {
         "факультеты университета",
         "институт",
         "учебные подразделения",
+        "факультеттер",
+        "кафедра",
+        "факультеты",
     ],
     "факультеты": [
         "факультет",
@@ -249,6 +258,8 @@ SYNONYM_MAP: Dict[str, List[str]] = {
         "как добраться",
         "контакты",
         "где находится",
+        "где находится университет",
+        "адрес университета",
     ],
 
     # ─── Лицензии / Аккредитация ────────────────────────────────
@@ -256,11 +267,13 @@ SYNONYM_MAP: Dict[str, List[str]] = {
         "лицензии",
         "аккредитация",
         "государственная лицензия",
+        "мемлекеттік лицензия",
     ],
     "аккредитация": [
         "лицензия",
         "аккредитация университета",
         "институциональная аккредитация",
+        "университет аккредитациясы",
     ],
 
     # ─── История / О вузе ───────────────────────────────────────
@@ -306,6 +319,8 @@ SYNONYM_MAP: Dict[str, List[str]] = {
         "миссия и видение",
         "цели университета",
         "стратегия университета",
+        "миссия және көзқарас",
+        "университет мақсаттары",
     ],
 
     # ─── Стоимость / Оплата (расширенный блок) ──────────────────
@@ -350,6 +365,8 @@ SYNONYM_MAP: Dict[str, List[str]] = {
         "ректор цаиу",
         "глава университета",
         "руководство университета",
+        "университет басшысы",
+        "басшылық",
     ],
     "кто ректор": [
         "ректор университета",
@@ -458,13 +475,6 @@ SYNONYM_MAP: Dict[str, List[str]] = {
     ],
 
     # ─── Грант / Стипендия ──────────────────────────────────────
-    "грант": [
-        "мемлекеттік грант",
-        "оқу гранты",
-        "гранттар",
-        "государственный грант",
-        "гранты на обучение",
-    ],
     "гранттар": [
         "грант",
         "оқу гранты",
@@ -479,12 +489,6 @@ SYNONYM_MAP: Dict[str, List[str]] = {
     ],
 
     # ─── Факультет / Кафедра ────────────────────────────────────
-    "факультет": [
-        "факультеттер",
-        "кафедра",
-        "институт",
-        "факультеты",
-    ],
     "факультеттер": [
         "факультет",
         "кафедра",
@@ -541,12 +545,6 @@ SYNONYM_MAP: Dict[str, List[str]] = {
     ],
 
     # ─── Ректор / Басшылық ──────────────────────────────────────
-    "ректор": [  # noqa: F811  (перекрывает русский ключ — казахский вариант)
-        "университет басшысы",
-        "басшылық",
-        "ректор цаиу",
-        "руководство университета",
-    ],
     "басшылық": [
         "ректор",
         "проректор",
@@ -561,23 +559,72 @@ SYNONYM_MAP: Dict[str, List[str]] = {
         "история университета",
         "об университете",
     ],
-    "миссия": [  # noqa: F811
-        "миссия және көзқарас",
-        "университет мақсаттары",
+
+    # ─── Дистанционное обучение ─────────────────────────────────
+    "дистанционно": [
+        "очно-дистанционная форма",
+        "онлайн обучение",
+        "дистанционное обучение",
+    ],
+    "дистанционное обучение": [
+        "очно-дистанционная",
+        "онлайн обучение",
+    ],
+
+    # ─── Юридический факультет ──────────────────────────────────
+    "юридический факультет": [
+        "факультет бизнеса и права",
+        "кафедра права",
+        "юриспруденция",
+    ],
+    "юриспруденция": [
+        "кафедра права",
+        "факультет бизнеса и права",
+    ],
+
+    # ─── Пороговые баллы ────────────────────────────────────────
+    "проходной балл": [
+        "пороговый балл",
+        "пороговые баллы",
+        "минимальный балл ент",
+    ],
+    "балл ент": [
+        "пороговые баллы",
+        "проходной балл",
+    ],
+
+    # ─── Отличия / Преимущества ─────────────────────────────────
+    "чем отличается": [
+        "преимущества университета",
+        "миссия университета",
+        "история университета",
+    ],
+    "преимущества": [
         "миссия и видение",
+        "преимущества цаиу",
+        "о вузе",
+    ],
+
+    # ─── Корпуса / Здания ───────────────────────────────────────
+    # "корпус" — часто задаваемый вопрос: "сколько корпусов", "где находится"
+    "корпус": [
+        "учебный корпус",
+        "здание университета",
+        "учебные корпуса",
+        "campus",
+    ],
+    "корпуса": [
+        "учебные корпуса",
+        "здания университета",
+        "учебный корпус",
+    ],
+    "здание": [
+        "учебный корпус",
+        "здание университета",
+        "где находится",
     ],
 
     # ─── Лицензия / Аккредитация ────────────────────────────────
-    "лицензия": [  # noqa: F811
-        "аккредитация",
-        "мемлекеттік лицензия",
-        "государственная лицензия",
-    ],
-    "аккредитация": [  # noqa: F811
-        "лицензия",
-        "университет аккредитациясы",
-        "аккредитация университета",
-    ],
 
     # ─── Әскери кафедра ─────────────────────────────────────────
     "әскери кафедра": [
@@ -650,48 +697,35 @@ def _expand_query(query: str) -> List[str]:
     Return a list of query variants for multi-query search.
 
     Strategy:
-    1. Always include the original query (already preprocessed)
-    2. Check if any word or phrase in the query matches a key in SYNONYM_MAP
-       — сначала точное совпадение, затем нечёткое (для опечаток)
-    3. For each match: add up to 2 synonym queries
-
-    Returns at most 3 queries total to keep API costs low.
+    1. Always include the original query
+    2. Check SYNONYM_MAP for exact substring matches
+    3. If no match — try fuzzy matching (catches typos like "абщежитие")
+    4. Return at most 3 queries total to keep API costs low.
     """
     if not settings.QUERY_EXPANSION_ENABLED:
         return [query]
 
     query_lower = query.lower()
     extra_queries = []
-    matched_keyword = None
 
-    # ── Шаг 1: точное совпадение (как было раньше) ────────────────
+    # ── Шаг 1: точное подстроковое совпадение ────────────────────
     for keyword, synonyms in SYNONYM_MAP.items():
         if keyword in query_lower:
-            matched_keyword = keyword
             for syn in synonyms[:2]:
-                variant = re.sub(
-                    re.escape(keyword),
-                    syn,
-                    query_lower,
-                    flags=re.IGNORECASE,
-                )
-                if variant not in extra_queries and variant != query_lower:
-                    extra_queries.append(variant)
+                if syn not in extra_queries and syn != query_lower:
+                    extra_queries.append(syn)
                 if len(extra_queries) >= 2:
                     break
-            if len(extra_queries) >= 2:
+            if extra_queries:
                 break
 
-    # ── Шаг 2: нечёткое совпадение (новое — для опечаток) ─────────
-    # Запускаем только если точное совпадение ничего не нашло
+    # ── Шаг 2: нечёткое совпадение (опечатки) ─────────────────────
     if not extra_queries:
         fuzzy_key = _fuzzy_match_keywords(query_lower)
         if fuzzy_key and fuzzy_key != query_lower:
-            logger.debug(f"Fuzzy match: '{query_lower}' → '{fuzzy_key}'")
+            logger.debug(f"Fuzzy expansion: '{query_lower[:50]}' → '{fuzzy_key}'")
             synonyms = SYNONYM_MAP[fuzzy_key]
-            # Добавляем сам исправленный ключ как вариант запроса
             extra_queries.append(fuzzy_key)
-            # И первый синоним
             if synonyms:
                 extra_queries.append(synonyms[0])
 
@@ -747,6 +781,48 @@ def _apply_score_gap_filter(results: List[SearchResult]) -> List[SearchResult]:
     return [r for r in results if r.score >= min_acceptable]
 
 
+# ── Ключевые слова для «списочных» запросов ───────────────────────────────────
+# Если вопрос касается полного перечня специальностей / факультетов,
+# обычных лимитов (5 чанков, 2 с одной страницы) катастрофически мало.
+# Для таких запросов переключаемся в «режим каталога»:
+#   top_k          → 25   (больше кандидатов из Qdrant)
+#   MAX_CONTEXT_CHUNKS → 15  (больше чанков в контекст GPT)
+#   max_per_page   → 5   (больше чанков с одной страницы)
+#   SCORE_GAP_THRESHOLD → 0.40  (не обрезаем релевантный хвост)
+LIST_QUERY_KEYWORDS = [
+    # Russian
+    "специальност", "направлени", "образовательн", "программ",
+    "факультет", "кафедр", "перечень", "список", "все направлени",
+    "какие специальност", "какие факультет", "какие направлени",
+    "есть специальност", "есть факультет",
+    # Kazakh
+    "мамандық", "мамандықтар", "факультеттер", "білім беру",
+    "бағдарлама", "тізімі",
+    # English
+    "specialt", "facult", "program", "department", "list of",
+]
+
+LIST_TOP_K              = 25
+LIST_MAX_CHUNKS         = 15
+LIST_MAX_PER_PAGE       = 5
+LIST_SCORE_GAP          = 0.40   # шире окно — не обрезаем релевантные хвосты
+LIST_QDRANT_THRESHOLD   = 0.15   # ниже порог Qdrant-запроса — пускаем больше кандидатов
+LIST_MIN_CONFIDENT      = 0.15   # ниже порог уверенности — факультетные страницы могут давать 0.20-0.25
+
+
+def _is_list_query(question: str) -> bool:
+    """
+    Определяет, является ли вопрос «каталожным» — требует перечисления.
+
+    Примеры:
+      «Какие специальности есть в ЦАИУ?»   → True
+      «Сколько стоит обучение?»             → False
+      «Перечисли все факультеты»            → True
+    """
+    q = question.lower()
+    return any(kw in q for kw in LIST_QUERY_KEYWORDS)
+
+
 def search(
     question: str,
     top_k: int = None,
@@ -755,13 +831,19 @@ def search(
     """
     Find most relevant chunks for a user question.
 
-    Improvements over naive similarity search:
-    - Query normalization (strips, collapses spaces)
-    - Query expansion via synonym dictionary (catches specialist/domain vocabulary)
-    - Multi-query: runs expanded queries in parallel, merges results
-    - Score gap filter: drops irrelevant tail
-    - Deduplication: removes same-text duplicates and limits per-page density
-    - Confidence check: returns [] if nothing is truly relevant
+    Pipeline:
+    1. Нормализация запроса
+    2. Определение режима: обычный vs «каталог» (специальности/факультеты)
+    3. Расширение запроса через SYNONYM_MAP (query expansion)
+    4. Семантический поиск (batch embeddings → Qdrant cosine similarity)
+    5. Проверка уверенности (confidence check)
+    6. Score gap filter — отсекаем нерелевантный хвост
+    7. Дедупликация + лимит по страницам
+    8. Обрезка до MAX_CONTEXT_CHUNKS
+
+    Question-chunk indexing (at ingest time) replaced BM25 runtime search:
+    for each chunk, GPT generated 4 questions stored as extra vectors.
+    User queries now match these question-vectors with high precision.
 
     Args:
         question:  User's question in any language
@@ -771,6 +853,7 @@ def search(
     Returns:
         List of SearchResult ordered by relevance (best first),
         already filtered, deduplicated, capped at MAX_CONTEXT_CHUNKS.
+        Поле score содержит cosine similarity (0.0–1.0).
     """
     if top_k is None:
         top_k = settings.TOP_K_RESULTS
@@ -782,11 +865,32 @@ def search(
     if not question:
         return []
 
-    # ── Step 2: Expand query into variants ────────────────────
+    # ── Step 2: Detect «catalog» mode ────────────────────────
+    # Для вопросов о специальностях / факультетах увеличиваем все лимиты,
+    # чтобы GPT видел полный список, а не первые 5 совпадений.
+    catalog_mode = _is_list_query(question)
+    if catalog_mode:
+        top_k           = max(top_k, LIST_TOP_K)
+        max_chunks      = LIST_MAX_CHUNKS
+        max_per_pg      = LIST_MAX_PER_PAGE
+        score_gap       = LIST_SCORE_GAP
+        # Ключевое: снижаем score_threshold для Qdrant-запроса — иначе
+        # страницы факультетов (score ~0.20-0.25) не дойдут до нашего кода
+        qdrant_threshold    = LIST_QDRANT_THRESHOLD
+        min_confident_score = LIST_MIN_CONFIDENT
+        logger.info(f"Catalog mode enabled for: '{question[:60]}'")
+    else:
+        max_chunks          = settings.MAX_CONTEXT_CHUNKS
+        max_per_pg          = 2
+        score_gap           = settings.SCORE_GAP_THRESHOLD
+        qdrant_threshold    = min_score          # стандартный порог из config
+        min_confident_score = settings.MIN_CONFIDENT_SCORE
+
+    # ── Step 3: Expand query into variants ────────────────────
     query_variants = _expand_query(question)
     logger.debug(f"Query variants: {query_variants}")
 
-    # ── Step 3: Multi-query search ────────────────────────────
+    # ── Step 3: Semantic search (Qdrant) ──────────────────────
     # Получаем все эмбеддинги за ОДИН батч-запрос к OpenAI
     # (было: N отдельных вызовов × ~2500ms = медленно)
     # (стало: 1 батч-запрос × ~500ms = быстро)
@@ -807,7 +911,7 @@ def search(
                  f"for {len(query_variants)} variants")
 
     qdrant = get_client()
-    all_results: List[SearchResult] = []
+    semantic_results: List[SearchResult] = []
     seen_ids: set = set()
 
     for variant, vector in zip(query_variants, vectors):
@@ -818,7 +922,7 @@ def search(
                 collection_name=settings.QDRANT_COLLECTION_NAME,
                 query_vector=vector,
                 limit=top_k,
-                score_threshold=min_score,
+                score_threshold=qdrant_threshold,   # в catalog mode = 0.15
                 with_payload=True,
             )
 
@@ -838,41 +942,53 @@ def search(
                     chunk_index=payload.get("chunk_index", 0),
                     score=round(hit.score, 4),
                 )
-                all_results.append(result)
+                semantic_results.append(result)
 
         except Exception as e:
             logger.warning(f"Search failed for variant '{variant[:60]}': {e}")
             continue
 
-    if not all_results:
-        return []
+    # Сортируем семантику по score (best first)
+    semantic_results.sort(key=lambda r: r.score, reverse=True)
 
-    # ── Step 4: Sort merged pool by score (best first) ────────
-    all_results.sort(key=lambda r: r.score, reverse=True)
+    semantic_best = semantic_results[0].score if semantic_results else 0.0
 
-    # ── Step 5: Confidence check ──────────────────────────────
-    # If even the best result isn't confident enough, return empty.
-    # Better no context than wrong context for ChatGPT.
-    if all_results[0].score < settings.MIN_CONFIDENT_SCORE:
+    # ── Step 4: Confidence check ──────────────────────────────────
+    # Если лучший результат ниже порога — вопрос не по теме, возвращаем пустой.
+    # В catalog_mode порог снижен до 0.15: страницы факультетов/специальностей
+    # могут давать score ~0.20-0.25 (разреженный контент), и их нельзя отбрасывать.
+    if semantic_best < min_confident_score:
         logger.debug(
-            f"Best score {all_results[0].score} < MIN_CONFIDENT_SCORE "
-            f"{settings.MIN_CONFIDENT_SCORE}, returning empty"
+            f"Not confident: best={semantic_best:.4f} < {min_confident_score} "
+            f"(catalog={catalog_mode}) — returning empty"
         )
         return []
 
-    # ── Step 6: Score gap filter ──────────────────────────────
-    filtered = _apply_score_gap_filter(all_results)
+    # ── Step 5: Score gap filter ──────────────────────────────────
+    # В catalog_mode используем более широкий score_gap (0.40 вместо 0.25),
+    # чтобы не отсекать страницы с отдельными специальностями/факультетами.
+    if not semantic_results:
+        return []
 
-    # ── Step 7: Deduplicate and limit per-page density ────────
-    deduped = _deduplicate_results(filtered, max_per_page=2)
+    best_score = semantic_results[0].score
+    min_acceptable = best_score - score_gap
+    filtered = [r for r in semantic_results if r.score >= min_acceptable]
 
-    # ── Step 8: Cap at MAX_CONTEXT_CHUNKS ─────────────────────
-    final = deduped[:settings.MAX_CONTEXT_CHUNKS]
+    if not filtered:
+        return []
+
+    # ── Step 6: Deduplicate and limit per-page density ───────────
+    # В catalog_mode max_per_pg=5, чтобы взять несколько чанков со страниц
+    # с длинными списками специальностей (они часто разбиты на 3-4 чанка).
+    deduped = _deduplicate_results(filtered, max_per_page=max_per_pg)
+
+    # ── Step 7: Cap at MAX_CONTEXT_CHUNKS ────────────────────────
+    final = deduped[:max_chunks]
 
     logger.info(
         f"Search '{question[:60]}': "
-        f"raw={len(all_results)}, after_gap={len(filtered)}, "
-        f"after_dedup={len(deduped)}, final={len(final)}"
+        f"catalog={catalog_mode}, semantic={len(semantic_results)}, best={semantic_best:.4f}, "
+        f"after_gap={len(filtered)}, after_dedup={len(deduped)}, final={len(final)}"
     )
 
     return final
@@ -883,7 +999,8 @@ def search_and_format_context(question: str) -> str:
     Search for relevant chunks and format them as context for ChatGPT.
 
     Returns a single string with all relevant chunks combined,
-    trimmed to MAX_CONTEXT_CHARS to prevent context bloat.
+    trimmed to MAX_CONTEXT_CHARS (или LIST_MAX_CONTEXT_CHARS для
+    каталожных запросов) to prevent context bloat.
 
     Format:
         [Источник: Общежитие]
@@ -897,6 +1014,13 @@ def search_and_format_context(question: str) -> str:
     if not results:
         return ""
 
+    # Для каталожных запросов разрешаем вдвое больше символов,
+    # чтобы все специальности/факультеты поместились в контекст GPT.
+    if _is_list_query(question):
+        max_chars = settings.MAX_CONTEXT_CHARS * 2  # ~12 000 символов
+    else:
+        max_chars = settings.MAX_CONTEXT_CHARS
+
     context_parts = []
     total_chars = 0
 
@@ -905,10 +1029,10 @@ def search_and_format_context(question: str) -> str:
         part = f"[Источник: {source}]\n{result.text}"
 
         # Don't exceed max context size
-        if total_chars + len(part) > settings.MAX_CONTEXT_CHARS:
+        if total_chars + len(part) > max_chars:
             # If this is the first chunk — include it truncated
             if not context_parts:
-                truncated = part[:settings.MAX_CONTEXT_CHARS]
+                truncated = part[:max_chars]
                 context_parts.append(truncated)
             break
 

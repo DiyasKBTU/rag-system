@@ -1,18 +1,28 @@
-# Корневой .gitignore для всего проекта
-# Субпроекты (rag_service, django-telegrambot) могут иметь свои .gitignore для специфичных правил
-
-# Переменные окружения — НИКОГДА не в git (содержат реальные ключи)
+# ── Переменные окружения — НИКОГДА не в git ──────────────────────────────────
+# .env.example НЕ игнорируется — это шаблон без ключей, нужен в git
 .env
 .env.local
 .env.*.local
-.env.example  # только если содержит примеры реальных ключей
+rag_service/.env
 
-# Секретные файлы
+# ── Секретные файлы — ключи, сервисные аккаунты ──────────────────────────────
 service_account.json
+rag_service/service_account.json
 *.key
 *.pem
 *.p12
 credentials.json
+*_credentials.json
+
+# ── Внутренние документы — не для публичного репо ────────────────────────────
+instructions/
+CLAUDE.md
+
+# ── Резервные копии ───────────────────────────────────────────────────────────
+backups/
+*.snapshot
+*.bak
+*.backup
 
 # IDE и редакторы
 .vscode/
@@ -68,9 +78,10 @@ htmlcov/
 .tox/
 .hypothesis/
 
-# Логи
+# ── Логи ─────────────────────────────────────────────────────────────────────
 *.log
 logs/
+rag_service/logs/
 
 # Бази данных
 *.db
@@ -79,16 +90,19 @@ logs/
 db.sqlite3
 db.sqlite3-journal
 
-# Django
-/staticfiles/
-/media/
-local_settings.py
-
 # OS specific
 .DS_Store
 Thumbs.db
 *.tmp
 
-# Курсорные файлы
+# ── ML/Data артефакты ────────────────────────────────────────────────────────
+bm25_index.pkl
+*.pkl
+*.npy
+*.npz
+
+# ── Курсорные файлы ───────────────────────────────────────────────────────────
 .cursorignore
 .cursorindexingignore
+instructions/
+.gitignore

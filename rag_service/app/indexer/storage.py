@@ -100,6 +100,25 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str) -> in
     if not chunks:
         return 0
 
+    # ── Дедупликация: убираем чанки с одинаковым текстом ──────
+    # Некоторые страницы повторяют один и тот же HTML-блок несколько раз
+    # (мобильная/десктопная версия, аккордеон-компоненты и т.д.)
+    seen_texts: set = set()
+    unique_chunks = []
+    for chunk in chunks:
+        key = (chunk.embed_text or chunk.text).strip()
+        if key not in seen_texts:
+            seen_texts.add(key)
+            unique_chunks.append(chunk)
+
+    duplicates = len(chunks) - len(unique_chunks)
+    if duplicates > 0:
+        import logging
+        logging.getLogger(__name__).info(
+            f"[Storage] Removed {duplicates} duplicate chunks for {page_url}"
+        )
+    chunks = unique_chunks
+
     client = get_client()
 
     # ── Step 1: Delete old chunks for this URL ─────────────────
@@ -107,9 +126,15 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str) -> in
     delete_chunks_by_url(page_url)
 
     # ── Step 2: Create vectors for all chunks at once ──────────
-    texts = [chunk.text for chunk in chunks]
-    print(f"  [Qdrant] Creating embeddings for {len(texts)} chunks...")
-    vectors = get_embeddings_batch(texts)
+    # For question-chunks: embed the question (embed_text), not the body text.
+    # This way the question vector is matched at search time,
+    # but payload["text"] still holds the original chunk for GPT context.
+    texts_for_embedding = [
+        chunk.embed_text if chunk.embed_text else chunk.text
+        for chunk in chunks
+    ]
+    print(f"  [Qdrant] Creating embeddings for {len(texts_for_embedding)} chunks...")
+    vectors = get_embeddings_batch(texts_for_embedding)
 
     if len(vectors) != len(chunks):
         print(f"  [!] Mismatch: {len(chunks)} chunks but {len(vectors)} vectors")
@@ -128,11 +153,12 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str) -> in
             # Metadata stored alongside the vector
             # This is what we return in search results
             payload={
-                "text": chunk.text,           # actual chunk text
-                "page_url": chunk.page_url,   # source page URL
-                "page_title": chunk.page_title, # page title
-                "chunk_index": chunk.index,   # position on page
-                "content_hash": content_hash, # page hash (for updates)
+                "text": chunk.text,                     # actual chunk text
+                "page_url": chunk.page_url,             # source page URL
+                "page_title": chunk.page_title,         # page title
+                "section_title": chunk.section_title,   # section heading (h2/h3)
+                "chunk_index": chunk.index,             # position on page
+                "content_hash": content_hash,           # page hash (for updates)
             },
         )
         points.append(point)
