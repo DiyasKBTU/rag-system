@@ -994,13 +994,15 @@ def search(
     return final
 
 
-def search_and_format_context(question: str) -> str:
+def format_results_as_context(question: str, results: List[SearchResult]) -> str:
     """
-    Search for relevant chunks and format them as context for ChatGPT.
+    Форматирует уже найденные результаты в строку контекста для ChatGPT.
+
+    Принимает ГОТОВЫЕ результаты — НЕ вызывает search() повторно.
+    Используется в main.py чтобы не делать два запроса к OpenAI Embeddings.
 
     Returns a single string with all relevant chunks combined,
-    trimmed to MAX_CONTEXT_CHARS (или LIST_MAX_CONTEXT_CHARS для
-    каталожных запросов) to prevent context bloat.
+    trimmed to MAX_CONTEXT_CHARS (или вдвое больше для каталожных запросов).
 
     Format:
         [Источник: Общежитие]
@@ -1009,8 +1011,6 @@ def search_and_format_context(question: str) -> str:
         [Источник: Специальности]
         Университет предлагает следующие специальности...
     """
-    results = search(question)
-
     if not results:
         return ""
 
@@ -1040,3 +1040,15 @@ def search_and_format_context(question: str) -> str:
         total_chars += len(part)
 
     return "\n\n".join(context_parts)
+
+
+def search_and_format_context(question: str) -> str:
+    """
+    Search for relevant chunks and format them as context for ChatGPT.
+
+    Вызывает search() и format_results_as_context() последовательно.
+    Используется только там где нет готовых результатов.
+    Если результаты уже есть — используй format_results_as_context() напрямую.
+    """
+    results = search(question)
+    return format_results_as_context(question, results)

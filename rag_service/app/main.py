@@ -20,9 +20,14 @@ main.py - FastAPI сервер RAG-сервиса.
   X-API-Key: your_secret_key_from_env
 """
 
+import asyncio
+import json
 import logging
 import time
+import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from app.logging_setup import setup_logging
 setup_logging("api")
@@ -33,11 +38,111 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.config import settings
-from app.retrieval.search import search, search_and_format_context
+from app.retrieval.search import search, format_results_as_context
 from app.indexer.storage import get_collection_stats, ensure_collection_exists
 
 
 logger = logging.getLogger(__name__)
+
+# ── Файл расписания горячей замены ───────────────────────────────────────────
+# Хранит: {"scheduled_time": "03:00", "scheduled_by": "admin_id", ...}
+_SCHEDULE_FILE = Path(__file__).resolve().parent.parent / "schedule_state.json"
+
+
+def _read_schedule() -> Optional[dict]:
+    """Читает расписание из файла. Возвращает None если файл не существует."""
+    try:
+        if _SCHEDULE_FILE.exists():
+            return json.loads(_SCHEDULE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return None
+
+
+def _write_schedule(data: Optional[dict]) -> None:
+    """Записывает расписание. data=None удаляет файл (отмена расписания)."""
+    if data is None:
+        try:
+            _SCHEDULE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    else:
+        tmp = _SCHEDULE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_SCHEDULE_FILE)
+
+
+def _parse_schedule_datetime(dt_str: str) -> Optional[datetime]:
+    """
+    Парсит строку даты+времени в объект datetime.
+
+    Поддерживаемые форматы:
+      "HH:MM"               — сегодня в это время (или завтра если уже прошло)
+      "DD.MM HH:MM"         — конкретная дата текущего года
+      "DD.MM.YYYY HH:MM"    — конкретная дата с годом
+
+    Возвращает None если формат не распознан.
+    """
+    import re
+    dt_str = dt_str.strip()
+    now = datetime.now()
+
+    # Формат 1: "HH:MM"
+    if re.match(r"^\d{2}:\d{2}$", dt_str):
+        t = datetime.strptime(dt_str, "%H:%M")
+        candidate = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        # Если время уже прошло сегодня — переносим на завтра.
+        # Используем timedelta вместо replace(day=...) — иначе крэш в конце месяца (day=32).
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    # Формат 2: "DD.MM HH:MM"
+    if re.match(r"^\d{2}\.\d{2} \d{2}:\d{2}$", dt_str):
+        return datetime.strptime(f"{dt_str}.{now.year}", "%d.%m %H:%M.%Y")
+
+    # Формат 3: "DD.MM.YYYY HH:MM"
+    if re.match(r"^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}$", dt_str):
+        return datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+
+    return None
+
+
+async def _scheduler_loop() -> None:
+    """
+    Фоновая корутина: проверяет расписание каждые 30 секунд.
+    Если текущее время совпадает с запланированным — запускает горячую переиндексацию.
+    Запускается один раз при старте FastAPI (в lifespan).
+    """
+    logger.info("[Scheduler] Background scheduler started (checks every 30s)")
+    while True:
+        try:
+            schedule = _read_schedule()
+            if schedule and not schedule.get("fired"):
+                scheduled_dt_str = schedule.get("scheduled_datetime", "")
+                if scheduled_dt_str:
+                    scheduled_dt = datetime.fromisoformat(scheduled_dt_str)
+                    now = datetime.now()
+                    # Запускаем если время пришло.
+                    # Допуск 5 минут — на случай если сервис рестартовал чуть после расписания.
+                    # fired=True предотвращает повторный запуск при следующей проверке.
+                    if now >= scheduled_dt and (now - scheduled_dt).total_seconds() <= 300:
+                        logger.info(f"[Scheduler] Firing scheduled indexing at {scheduled_dt_str}")
+                        schedule["fired"] = True
+                        schedule["fired_at"] = datetime.now(timezone.utc).isoformat()
+                        _write_schedule(schedule)
+
+                        from app.indexer.hot_swap import run_shadow_indexing
+                        t = threading.Thread(
+                            target=run_shadow_indexing,
+                            daemon=True,
+                            name="hot_swap_indexing",
+                        )
+                        t.start()
+        except Exception as e:
+            logger.error(f"[Scheduler] Error in scheduler loop: {e}")
+
+        await asyncio.sleep(30)
 
 
 # ── Startup / Shutdown ─────────────────────────────────────────
@@ -45,7 +150,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """
     Called once when server starts.
-    We connect to Qdrant and make sure collection exists.
+    Connects to Qdrant, ensures collection exists, starts background scheduler.
     """
     logger.info("Starting RAG service...")
     try:
@@ -56,8 +161,12 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to connect to Qdrant: {e}")
         logger.warning("Make sure Docker is running: docker-compose up -d")
 
+    # Запускаем планировщик в фоне
+    scheduler_task = asyncio.create_task(_scheduler_loop())
+
     yield  # Server is running
 
+    scheduler_task.cancel()
     logger.info("RAG service shutting down.")
 
 
@@ -69,7 +178,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Allow cross-origin requests (needed if Django is on different host)
+# Allow cross-origin requests from any origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -82,7 +191,7 @@ app.add_middleware(
 def verify_api_key(x_api_key: str = Header(..., description="Secret API key")):
     """
     Check that the request has a valid API key.
-    Django bot sends this key in every request header.
+    Bot sends this key in every request header.
 
     Usage: add  X-API-Key: your_secret_key  to request headers.
     """
@@ -93,7 +202,7 @@ def verify_api_key(x_api_key: str = Header(..., description="Secret API key")):
 
 # ── Request / Response models ─────────────────────────────────
 class SearchRequest(BaseModel):
-    """What Django bot sends to /search"""
+    """What the bot sends to /search"""
     question: str                      # User's question
     top_k: Optional[int] = None        # How many chunks to return (default from config)
     min_score: Optional[float] = None  # Minimum relevance score (default from config)
@@ -148,6 +257,39 @@ class StatsResponse(BaseModel):
     status: str
 
 
+class IndexStatusResponse(BaseModel):
+    """Response from GET /index/status"""
+    in_progress: bool
+    started_at: Optional[str]
+    active_collection: str
+    total_chunks: int
+    last_result: Optional[dict]
+    schedule: Optional[dict]
+
+
+class ScheduleRequest(BaseModel):
+    """
+    Request body for POST /index/schedule.
+
+    Поддерживаемые форматы поля `datetime`:
+      "HH:MM"            — сегодня в это время (если прошло — завтра)
+      "DD.MM HH:MM"      — конкретный день текущего года
+      "DD.MM.YYYY HH:MM" — конкретный день с годом
+    """
+    datetime: str  # например "03:00", "15.06 03:00", "15.06.2025 03:00"
+
+    class Config:
+        json_schema_extra = {
+            "example": {"datetime": "15.06 03:00"}
+        }
+
+
+class ScheduleResponse(BaseModel):
+    """Response from /index/schedule"""
+    message: str
+    scheduled_datetime: str
+
+
 # ── Endpoints ──────────────────────────────────────────────────
 
 @app.get("/health")
@@ -199,31 +341,16 @@ def search_endpoint(
     start_time = time.time()
 
     try:
-        # Search for relevant chunks
+        # Один вызов search() → форматируем готовые результаты.
+        # format_results_as_context не вызывает search() повторно — нет двойных расходов.
         results = search(
             question=question,
             top_k=request.top_k,
             min_score=request.min_score,
         )
-
-        # Format as context string for ChatGPT
-        # Uses search_and_format_context to respect MAX_CONTEXT_CHARS limit
-        if results:
-            context = search_and_format_context(question)
-            # If search_and_format_context returned empty (shouldn't happen
-            # if results is non-empty), fall back to manual formatting
-            if not context:
-                context_parts = []
-                for result in results:
-                    source = result.page_title or result.page_url
-                    part = f"[Источник: {source}]\n{result.text}"
-                    context_parts.append(part)
-                context = "\n\n".join(context_parts)
-        else:
-            context = ""
+        context = format_results_as_context(question, results) if results else ""
 
         elapsed_ms = int((time.time() - start_time) * 1000)
-
         logger.info(f"Found {len(results)} chunks in {elapsed_ms}ms")
 
         return SearchResponse(
@@ -248,134 +375,13 @@ def search_endpoint(
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
-def _run_indexing():
+def _run_hot_swap_indexing():
     """
-    Background indexing task.
-    Imports here to avoid circular imports and slow startup.
+    Запускает горячую переиндексацию (shadow indexing + atomic alias swap).
+    Используется как фоновая задача FastAPI.
     """
-    import time as time_module
-    from app.parser.crawler import get_urls_for_indexing
-    from app.parser.extractor import get_page_content
-    from app.parser.chunker import split_into_chunks
-    from app.indexer.storage import save_chunks, page_needs_update
-    from app.indexer.question_generator import generate_question_chunks
-
-    logger.info("Background indexing started")
-
-    urls = get_urls_for_indexing()
-    logger.info(f"Indexing {len(urls)} pages...")
-
-    total_pages = 0
-    total_chunks = 0
-
-    for i, url_item in enumerate(urls, 1):
-        url = url_item.url
-        logger.info(f"[{i}/{len(urls)}] Processing: {url}")
-
-        content = get_page_content(url)
-        if not content:
-            logger.warning(f"  Skipped (no content): {url}")
-            time_module.sleep(settings.REQUEST_DELAY)
-            continue
-
-        if not page_needs_update(url, content.content_hash):
-            logger.info(f"  Skipped (not changed): {url}")
-            continue
-
-        chunks = split_into_chunks(
-            text=content.text,
-            page_url=content.url,
-            page_title=content.title,
-        )
-
-        if not chunks:
-            logger.warning(f"  Skipped (no chunks): {url}")
-            time_module.sleep(settings.REQUEST_DELAY)
-            continue
-
-        # Generate question-chunks (same as CLI indexer)
-        question_chunks = generate_question_chunks(chunks)
-
-        all_chunks = chunks + question_chunks
-        saved = save_chunks(all_chunks, content.url, content.content_hash)
-        total_pages += 1
-        total_chunks += saved
-        logger.info(f"  Saved {saved} chunks ({len(chunks)} text + {len(question_chunks)} questions) for: {content.title or url}")
-
-        if i < len(urls):
-            time_module.sleep(settings.REQUEST_DELAY)
-
-    # ── Индексируем Google Docs ───────────────────────────────────
-    # Объединяем одиночный GOOGLE_DOC_ID из .env и список GOOGLE_DOC_IDS
-    all_google_docs = list(settings.GOOGLE_DOC_IDS)
-    if settings.GOOGLE_DOC_ID:
-        all_google_docs.insert(0, {"id": settings.GOOGLE_DOC_ID, "title": ""})
-
-    if all_google_docs:
-        from app.parser.google_docs_reader import read_google_doc
-        import hashlib
-
-        logger.info(f"Indexing {len(all_google_docs)} Google Docs...")
-
-        for doc_cfg in all_google_docs:
-            doc_id = doc_cfg.get("id", "")
-            doc_title = doc_cfg.get("title", "")
-            if not doc_id:
-                continue
-
-            doc = read_google_doc(
-                doc_id=doc_id,
-                title=doc_title,
-                service_account_file=settings.GOOGLE_SERVICE_ACCOUNT_FILE,
-            )
-            if not doc:
-                logger.warning(f"  Skipped Google Doc (could not read): {doc_id}")
-                continue
-
-            content_hash = hashlib.md5(doc.text.encode()).hexdigest()
-
-            # Skip if document hasn't changed (same as website pages)
-            if not page_needs_update(doc.source_url, content_hash):
-                logger.info(f"  Skipped Google Doc (not changed): {doc.title or doc_id}")
-                continue
-
-            chunks = split_into_chunks(
-                text=doc.text,
-                page_url=doc.source_url,
-                page_title=doc.title,
-            )
-            if not chunks:
-                logger.warning(f"  Skipped Google Doc (no chunks): {doc.title or doc_id}")
-                continue
-
-            # Generate question-chunks (same as website pages — was missing before!)
-            question_chunks = generate_question_chunks(chunks)
-
-            all_doc_chunks = chunks + question_chunks
-            saved = save_chunks(all_doc_chunks, doc.source_url, content_hash)
-            total_chunks += saved
-            logger.info(
-                f"  Google Doc '{doc.title}': "
-                f"chunks={len(chunks)}, questions={len(question_chunks)}, saved={saved}"
-            )
-
-    # ── Строим сводные каталог-чанки ─────────────────────────────────
-    # Синтетические чанки со ВСЕМИ специальностями и факультетами.
-    # Решает проблему неполных ответов на «какие специальности».
-    try:
-        from app.indexer.catalog_builder import build_and_save_catalog_chunks
-        catalog_saved = build_and_save_catalog_chunks()
-        logger.info(f"Catalog chunks saved: {catalog_saved}")
-    except Exception as e:
-        logger.warning(f"Catalog build failed (non-critical): {e}")
-
-    stats = get_collection_stats()
-    logger.info(
-        f"Indexing complete! "
-        f"Pages: {total_pages}, "
-        f"New chunks: {total_chunks}, "
-        f"Total in Qdrant: {stats['total_chunks']}"
-    )
+    from app.indexer.hot_swap import run_shadow_indexing
+    run_shadow_indexing()
 
 
 @app.post("/index", response_model=IndexResponse)
@@ -385,31 +391,168 @@ def index_endpoint(
     api_key: str = Depends(verify_api_key),
 ):
     """
-    Trigger re-indexing of all pages.
+    Запускает полную переиндексацию с горячей заменой базы знаний.
 
-    If background=True (default): starts indexing in background, returns immediately.
-    If background=False: waits for indexing to complete (WARNING: can take 10-30 minutes!).
+    Индексирует в теневую коллекцию, затем атомарно переключает алиас.
+    Бот продолжает работать во время индексации — переключение происходит
+    мгновенно когда новые данные готовы.
 
-    Call this after updating content on caiu.edu.kz.
+    background=True (по умолчанию): возвращает сразу, индексация идёт фоном.
+    background=False: ждёт завершения (ВНИМАНИЕ: 30-60 минут!).
 
-    Example request:
+    Пример:
         POST /index
         Headers: X-API-Key: your_secret_key
         Body: {"background": true}
     """
+    from app.indexer.hot_swap import get_indexing_status
+    status = get_indexing_status()
+    if status["in_progress"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Indexing already in progress. Check /index/status for details.",
+        )
+
     logger.info(f"Index request received. background={request.background}")
 
     if request.background:
-        background_tasks.add_task(_run_indexing)
+        background_tasks.add_task(_run_hot_swap_indexing)
         return IndexResponse(
-            message="Indexing started in background. Check /stats to monitor progress.",
+            message="Hot-swap indexing started in background. "
+                    "Bot continues working. Check /index/status to monitor progress.",
             status="started",
         )
     else:
-        # Synchronous - wait for completion (blocks the request!)
-        _run_indexing()
+        # Синхронно — ждём завершения (блокирует запрос!)
+        from app.indexer.hot_swap import run_shadow_indexing
+        result = run_shadow_indexing()
         stats = get_collection_stats()
         return IndexResponse(
-            message=f"Indexing complete. Total chunks: {stats['total_chunks']}",
+            message=f"Indexing complete. Active: '{result.get('swapped_to', '?')}'. "
+                    f"Total chunks: {stats['total_chunks']}",
             status="completed",
         )
+
+
+@app.get("/index/status", response_model=IndexStatusResponse)
+def index_status_endpoint(api_key: str = Depends(verify_api_key)):
+    """
+    Возвращает текущее состояние индексации и активную коллекцию.
+
+    Пример:
+        GET /index/status
+        Headers: X-API-Key: your_secret_key
+    """
+    from app.indexer.hot_swap import get_indexing_status
+    status = get_indexing_status()
+    schedule = _read_schedule()
+
+    # Добавляем читаемое время в расписание для удобства
+    if schedule and schedule.get("scheduled_datetime"):
+        try:
+            dt = datetime.fromisoformat(schedule["scheduled_datetime"])
+            schedule["scheduled_datetime_human"] = dt.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            pass
+
+    return IndexStatusResponse(
+        in_progress=status["in_progress"],
+        started_at=status.get("started_at"),
+        active_collection=status["active_collection"],
+        total_chunks=status["total_chunks"],
+        last_result=status.get("last_result"),
+        schedule=schedule,
+    )
+
+
+@app.post("/index/schedule", response_model=ScheduleResponse)
+def schedule_index_endpoint(
+    request: ScheduleRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Запланировать горячую переиндексацию на указанную дату и время.
+
+    Форматы поля datetime:
+      "HH:MM"            — сегодня/завтра в это время
+      "DD.MM HH:MM"      — конкретный день текущего года
+      "DD.MM.YYYY HH:MM" — конкретный день с годом
+
+    Если расписание уже существует — возвращает 409. Сначала отмени через DELETE /index/schedule.
+
+    Пример:
+        POST /index/schedule
+        Headers: X-API-Key: your_secret_key
+        Body: {"datetime": "15.06 03:00"}
+    """
+    # Проверяем нет ли уже активного расписания
+    existing = _read_schedule()
+    if existing and not existing.get("fired"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Indexing already scheduled for {existing.get('scheduled_datetime', '?')}. "
+                   f"Cancel it first via DELETE /index/schedule.",
+        )
+
+    # Парсим дату/время
+    scheduled_dt = _parse_schedule_datetime(request.datetime)
+    if scheduled_dt is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid datetime format. Supported formats: "
+                "'HH:MM', 'DD.MM HH:MM', 'DD.MM.YYYY HH:MM'. "
+                "Example: '03:00' or '15.06 03:00'"
+            ),
+        )
+
+    if scheduled_dt <= datetime.now():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Scheduled time {scheduled_dt.strftime('%d.%m.%Y %H:%M')} is in the past.",
+        )
+
+    schedule_data = {
+        "scheduled_datetime": scheduled_dt.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "fired": False,
+    }
+    _write_schedule(schedule_data)
+
+    human_dt = scheduled_dt.strftime("%d.%m.%Y %H:%M")
+    logger.info(f"Indexing scheduled for {human_dt}")
+
+    return ScheduleResponse(
+        message=f"Hot-swap indexing scheduled for {human_dt} (server local time). "
+                f"Cancel via DELETE /index/schedule.",
+        scheduled_datetime=human_dt,
+    )
+
+
+@app.delete("/index/schedule", response_model=IndexResponse)
+def unschedule_index_endpoint(api_key: str = Depends(verify_api_key)):
+    """
+    Отменить запланированную переиндексацию.
+
+    Пример:
+        DELETE /index/schedule
+        Headers: X-API-Key: your_secret_key
+    """
+    schedule = _read_schedule()
+    if not schedule:
+        raise HTTPException(status_code=404, detail="No indexing is scheduled.")
+
+    scheduled_dt_str = schedule.get("scheduled_datetime", "?")
+    # Форматируем для человека если возможно
+    try:
+        scheduled_human = datetime.fromisoformat(scheduled_dt_str).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        scheduled_human = scheduled_dt_str
+
+    _write_schedule(None)  # удаляем файл
+    logger.info(f"Scheduled indexing at {scheduled_human} was cancelled")
+
+    return IndexResponse(
+        message=f"Scheduled indexing at {scheduled_human} has been cancelled.",
+        status="cancelled",
+    )

@@ -179,13 +179,15 @@ def _save_synthetic_chunk(
     page_title: str,
     text: str,
     embed_texts: List[str],
+    collection_name: Optional[str] = None,
 ) -> int:
     """Сохраняет синтетический чанк в Qdrant (один текст, N векторов)."""
     if not text or not embed_texts:
         return 0
 
+    _col = collection_name or settings.QDRANT_COLLECTION_NAME
     client = get_client()
-    delete_chunks_by_url(virtual_url)
+    delete_chunks_by_url(virtual_url, collection_name=_col)
 
     try:
         vectors = get_embeddings_batch(embed_texts)
@@ -216,7 +218,7 @@ def _save_synthetic_chunk(
             },
         ))
 
-    client.upsert(collection_name=settings.QDRANT_COLLECTION_NAME, points=points)
+    client.upsert(collection_name=_col, points=points)
     logger.info(f"[Catalog] Saved {len(points)} vectors: {page_title}")
     return len(points)
 
@@ -234,7 +236,7 @@ FACULTY_URLS = [
 ]
 
 
-def build_faculties_catalog() -> int:
+def build_faculties_catalog(collection_name: Optional[str] = None) -> int:
     """
     4 факультета ЦАИУ.
     Скачивает каждую страницу факультета, берёт h1 как название.
@@ -295,6 +297,7 @@ def build_faculties_catalog() -> int:
         page_title="Факультеты ЦАИУ — полный список",
         text=catalog_text,
         embed_texts=embed_queries,
+        collection_name=collection_name,
     )
     print(f"  [Catalog] Faculties: {saved} vectors saved")
     return saved
@@ -329,7 +332,7 @@ DEPARTMENT_URLS = [
 ]
 
 
-def build_departments_catalog() -> int:
+def build_departments_catalog(collection_name: Optional[str] = None) -> int:
     """
     Кафедры и их образовательные программы.
 
@@ -396,6 +399,7 @@ def build_departments_catalog() -> int:
             page_title=f"Кафедра {name} — образовательные программы",
             text=dept_text,
             embed_texts=dept_queries,
+            collection_name=collection_name,
         )
         total_saved += saved
         time.sleep(0.5)
@@ -441,6 +445,7 @@ def build_departments_catalog() -> int:
         page_title="Кафедры ЦАИУ — полный список",
         text=catalog_text,
         embed_texts=embed_queries,
+        collection_name=collection_name,
     )
     total_saved += summary_saved
     print(f"  [Catalog] Departments total: {total_saved} vectors saved "
@@ -475,7 +480,7 @@ SPECIALTY_URLS = [
 ]
 
 
-def build_specialties_catalog() -> int:
+def build_specialties_catalog(collection_name: Optional[str] = None) -> int:
     """
     Список специальностей (образовательных программ) бакалавриата.
     Берём h1 с каждой страницы специальности.
@@ -535,6 +540,7 @@ def build_specialties_catalog() -> int:
         page_title="Специальности ЦАИУ — полный список",
         text=catalog_text,
         embed_texts=embed_queries,
+        collection_name=collection_name,
     )
     print(f"  [Catalog] Specialties: {saved} vectors saved")
     return saved
@@ -544,11 +550,16 @@ def build_specialties_catalog() -> int:
 # ТОЧКА ВХОДА
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_and_save_catalog_chunks() -> int:
-    """Строит все три каталога: факультеты, кафедры+ОП, специальности."""
+def build_and_save_catalog_chunks(collection_name: Optional[str] = None) -> int:
+    """
+    Строит все три каталога: факультеты, кафедры+ОП, специальности.
+
+    Args:
+        collection_name: Target collection. Defaults to settings value.
+    """
     total = 0
-    total += build_faculties_catalog()
-    total += build_departments_catalog()
-    total += build_specialties_catalog()
+    total += build_faculties_catalog(collection_name=collection_name)
+    total += build_departments_catalog(collection_name=collection_name)
+    total += build_specialties_catalog(collection_name=collection_name)
     print(f"\n[Catalog] All done. Total catalog vectors: {total}")
     return total
