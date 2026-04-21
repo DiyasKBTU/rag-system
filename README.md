@@ -24,7 +24,6 @@
 │   ├── check_chunks.py     ← Посмотреть что в базе
 │   └── debug_search.py     ← Проверить поиск по запросу
 │
-├── .env.example            ← Шаблон конфигурации
 ├── requirements.txt        ← Зависимости Python
 └── docker-compose.yml      ← База данных
 ```
