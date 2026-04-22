@@ -16,30 +16,31 @@ catalog_builder.py — Построитель сводных чанков для
     python tools/rebuild_catalog.py
 """
 
-import re
 import logging
+import re
 import hashlib
 import uuid
 import time
 from typing import List, Tuple, Optional
 
+from qdrant_client.models import PointStruct
+
 from app.config import settings
 from app.indexer.embeddings import get_embeddings_batch
 from app.indexer.storage import get_client, delete_chunks_by_url
+from app.utils import KAZAKH_CHARS
 
 logger = logging.getLogger(__name__)
 
 # ── Виртуальные URL синтетических чанков ─────────────────────────────────────
 CATALOG_URL_FACULTIES   = "https://caiu.edu.kz/__catalog__/faculties"
 CATALOG_URL_SPECIALTIES = "https://caiu.edu.kz/__catalog__/specialties"
-
-# ── Казахские буквы которых нет в русском ─────────────────────────────────────
-_KAZAKH_CHARS = set("әғқңөұүһіӘҒҚҢӨҰҮҺІ")
+CATALOG_URL_DEPARTMENTS = "https://caiu.edu.kz/__catalog__/departments"
 
 
 def _is_kazakh(text: str) -> bool:
     """True если в тексте есть казахские буквы (не русские и не латинские)."""
-    return any(ch in _KAZAKH_CHARS for ch in text)
+    return any(ch in KAZAKH_CHARS for ch in text)
 
 
 def _normalize(text: str) -> str:
@@ -61,6 +62,11 @@ _SKIP_HEADINGS = {
     "профильные предметы", "процедура приёма на бакалавриат",
 }
 
+_KAZ_SUFFIXES = (
+    "кафедрасы", "факультеті", "кафедра болімі",
+    "бөлімі", "мамандығы", " және ", "кафедраның",
+)
+
 
 def _is_valid_heading(text: str) -> bool:
     if not text or len(text) < 4:
@@ -69,11 +75,7 @@ def _is_valid_heading(text: str) -> bool:
         return False
     if text.lower() in _SKIP_HEADINGS:
         return False
-    # Казахские суффиксы для слов — «кафедра» по-казахски — «кафедрасы»,
-    # «факультет» — «факультеті», «отделение» — «бөлімі» и т.д.
     lower = text.lower()
-    _KAZ_SUFFIXES = ("кафедрасы", "факультеті", "кафедра болімі",
-                     "бөлімі", "мамандығы", " және ", "кафедраның")
     if any(s in lower for s in _KAZ_SUFFIXES):
         return False
     return True
@@ -104,7 +106,6 @@ def _parse_sections(text: str) -> List[Tuple[str, str]]:
 
     for line in text.split("\n"):
         if line.startswith("## "):
-            # Сохраняем предыдущую секцию
             body = "\n".join(current_lines).strip()
             if body and _is_valid_heading(current_title):
                 sections.append((current_title, body))
@@ -147,20 +148,6 @@ def _extract_op_lines(text: str) -> List[str]:
     return ops
 
 
-def _extract_all_op_from_text(text: str) -> List[str]:
-    """Алиас для единообразия — то же самое что _extract_op_lines."""
-    ops = []
-    seen = set()
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line or _is_kazakh(line):
-            continue
-        if re.search(r"[67][ВBвb]\d{4,}", line) and line not in seen:
-            seen.add(line)
-            ops.append(line)
-    return ops
-
-
 def _filter_russian_lines(text: str, max_chars: int = 6000) -> str:
     """Убирает казахские строки из текста, оставляет русские и латинские."""
     lines = []
@@ -200,21 +187,20 @@ def _save_synthetic_chunk(
 
     content_hash = hashlib.md5(text.encode()).hexdigest()
 
-    from qdrant_client.models import PointStruct
     points = []
     for embed_text, vector in zip(embed_texts, vectors):
         points.append(PointStruct(
             id=str(uuid.uuid4()),
             vector=vector,
             payload={
-                "text": text,
-                "page_url": virtual_url,
-                "page_title": page_title,
-                "section_title": "",
-                "chunk_index": 0,
-                "content_hash": content_hash,
+                "text":             text,
+                "page_url":         virtual_url,
+                "page_title":       page_title,
+                "section_title":    "",
+                "chunk_index":      0,
+                "content_hash":     content_hash,
                 "is_catalog_chunk": True,
-                "embed_text": embed_text,
+                "embed_text":       embed_text,
             },
         ))
 
@@ -241,31 +227,28 @@ def build_faculties_catalog(collection_name: Optional[str] = None) -> int:
     4 факультета ЦАИУ.
     Скачивает каждую страницу факультета, берёт h1 как название.
     """
-    print("\n[Catalog] Building faculties catalog...")
+    logger.info("[Catalog] Building faculties catalog...")
     faculties: List[str] = []
 
     for url in FACULTY_URLS:
         content = _get_page_content(url)
         if not content:
-            print(f"  [!] Could not fetch: {url}")
+            logger.warning(f"[Catalog] Could not fetch: {url}")
             time.sleep(1)
             continue
 
-        # h1 — первая строка текста (extractor.py ставит title в начало)
-        first_line = content.text.split("\n")[0].strip()
-        title = _normalize(first_line) if first_line else content.title
-        title = _normalize(content.title or first_line)
+        title = _normalize(content.title or content.text.split("\n")[0].strip())
 
         if title and not _is_kazakh(title) and title not in faculties:
             faculties.append(title)
-            print(f"  [факультет] {title}")
+            logger.info(f"[Catalog] Faculty: {title}")
         else:
-            print(f"  [!] Bad title '{title}': {url}")
+            logger.warning(f"[Catalog] Bad faculty title '{title}': {url}")
 
         time.sleep(1)
 
     if not faculties:
-        print("  [!] No faculties found")
+        logger.warning("[Catalog] No faculties found")
         return 0
 
     lines = [
@@ -277,7 +260,7 @@ def build_faculties_catalog(collection_name: Optional[str] = None) -> int:
     lines.append("\nКонтакты и расписание: caiu.edu.kz/faculties-ru/")
 
     catalog_text = "\n".join(lines)
-    print(f"\n  Список факультетов:\n{catalog_text}")
+    logger.info(f"[Catalog] Faculties list:\n{catalog_text}")
 
     embed_queries = [
         "какие факультеты есть в ЦАИУ",
@@ -299,7 +282,7 @@ def build_faculties_catalog(collection_name: Optional[str] = None) -> int:
         embed_texts=embed_queries,
         collection_name=collection_name,
     )
-    print(f"  [Catalog] Faculties: {saved} vectors saved")
+    logger.info(f"[Catalog] Faculties: {saved} vectors saved")
     return saved
 
 
@@ -309,15 +292,10 @@ def build_faculties_catalog(collection_name: Optional[str] = None) -> int:
 # ПРОБЛЕМА: kaferdra-ru/ рендерится через JavaScript — статический HTML
 #           отдаёт только 3 кафедры из 11.
 #
-# РЕШЕНИЕ: хардкод. Заполните DEPT_CATALOG ниже глядя на сайт caiu.edu.kz/kaferdra-ru/
-#          Структура: {"Название кафедры": ["ОП1", "ОП2", ...], ...}
-#          ОП = образовательная программа (можно оставить пустой список [])
+# РЕШЕНИЕ: 10 индивидуальных страниц кафедр скачиваются напрямую.
 # ─────────────────────────────────────────────────────────────────────────────
 
-CATALOG_URL_DEPARTMENTS = "https://caiu.edu.kz/__catalog__/departments"
-
 # 10 индивидуальных страниц кафедр ЦАИУ
-# Каждая страница содержит h1 = название кафедры + список ОП
 DEPARTMENT_URLS = [
     "https://caiu.edu.kz/business-and-tourism-ru/",
     "https://caiu.edu.kz/management-and-finance-ru/",
@@ -341,7 +319,7 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
     2. ОТДЕЛЬНЫЙ на каждую кафедру — её название + ОП-коды
        (вопросы: "какие ОП в кафедре бизнеса", "специальности кафедры права")
     """
-    print(f"\n[Catalog] Building departments catalog ({len(DEPARTMENT_URLS)} pages)...")
+    logger.info(f"[Catalog] Building departments catalog ({len(DEPARTMENT_URLS)} pages)...")
 
     dept_entries: List[tuple] = []   # (name, ops_list, url)
     total_saved = 0
@@ -349,7 +327,7 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
     for url in DEPARTMENT_URLS:
         content = _get_page_content(url)
         if not content:
-            print(f"  [!] Could not fetch: {url}")
+            logger.warning(f"[Catalog] Could not fetch: {url}")
             time.sleep(1)
             continue
 
@@ -359,16 +337,15 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
             name = _normalize(first_line)
 
         if not name or len(name) < 4:
-            print(f"  [!] No usable title: {url}")
+            logger.warning(f"[Catalog] No usable title: {url}")
             time.sleep(1)
             continue
 
-        # Строго: только строки с кодами 6В...
         ops = _extract_op_lines(content.text)
         dept_entries.append((name, ops, url))
-        print(f"  [кафедра] {name} → {len(ops)} ОП")
+        logger.info(f"[Catalog] Department: {name} → {len(ops)} ОП")
 
-        # ── Отдельный чанк на эту кафедру ─────────────────────────────────────
+        # ── Отдельный чанк на эту кафедру ──────────────────────────────────
         dept_lines = [f"Кафедра: {name}\n"]
         if ops:
             dept_lines.append("Реализуемые образовательные программы:")
@@ -379,7 +356,6 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
         dept_lines.append(f"\nПодробнее: {url}")
         dept_text = "\n".join(dept_lines)
 
-        # Запросы для этой конкретной кафедры
         short_name = name.lower()
         dept_queries = [
             f"какие специальности в кафедре {short_name}",
@@ -390,7 +366,6 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
             f"направления обучения кафедра {short_name}",
         ]
 
-        # Виртуальный URL для этой кафедры в каталоге
         slug = url.rstrip("/").split("/")[-1]
         dept_virtual_url = f"https://caiu.edu.kz/__catalog__/dept/{slug}"
 
@@ -405,10 +380,10 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
         time.sleep(0.5)
 
     if not dept_entries:
-        print("  [!] No departments fetched!")
+        logger.warning("[Catalog] No departments fetched!")
         return 0
 
-    # ── Сводный чанк — все 10 кафедр ──────────────────────────────────────────
+    # ── Сводный чанк — все кафедры ──────────────────────────────────────────
     summary_lines = [
         "Кафедры ЦАИУ (Центральноазиатский инновационный университет):\n",
         f"Всего кафедр: {len(dept_entries)}\n",
@@ -424,8 +399,7 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
     if len(catalog_text) > 10000:
         catalog_text = catalog_text[:10000] + "\n...(полный список: caiu.edu.kz/kaferdra-ru/)"
 
-    print(f"\n  Сводный текст кафедр (первые 600 символов):")
-    print(catalog_text[:600])
+    logger.info(f"[Catalog] Departments summary (first 600 chars):\n{catalog_text[:600]}")
 
     embed_queries = [
         "кафедры ЦАИУ полный список",
@@ -448,17 +422,18 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
         collection_name=collection_name,
     )
     total_saved += summary_saved
-    print(f"  [Catalog] Departments total: {total_saved} vectors saved "
-          f"({len(dept_entries)} dept chunks + {summary_saved} summary)")
+    logger.info(
+        f"[Catalog] Departments total: {total_saved} vectors saved "
+        f"({len(dept_entries)} dept chunks + {summary_saved} summary)"
+    )
     return total_saved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# СПЕЦИАЛЬНОСТИ (ОП) — отдельный сводный чанк только с названиями
+# СПЕЦИАЛЬНОСТИ (ОП) — сводный чанк только с названиями
 # ─────────────────────────────────────────────────────────────────────────────
 
 SPECIALTY_URLS = [
-    # Индивидуальные страницы специальностей — h1 = название
     "https://caiu.edu.kz/bachelor-law-ru/",
     "https://caiu.edu.kz/bachelor-customs-ru/",
     "https://caiu.edu.kz/https-caiu-edu-kz-bachelor-kaz-lang-ru/",
@@ -485,27 +460,27 @@ def build_specialties_catalog(collection_name: Optional[str] = None) -> int:
     Список специальностей (образовательных программ) бакалавриата.
     Берём h1 с каждой страницы специальности.
     """
-    print("\n[Catalog] Building specialties catalog...")
+    logger.info("[Catalog] Building specialties catalog...")
     specialties: List[str] = []
 
     for url in SPECIALTY_URLS:
         content = _get_page_content(url)
         if not content:
-            print(f"  [!] Could not fetch: {url}")
+            logger.warning(f"[Catalog] Could not fetch: {url}")
             time.sleep(1)
             continue
 
         title = _normalize(content.title)
         if title and not _is_kazakh(title) and _is_valid_heading(title) and title not in specialties:
             specialties.append(title)
-            print(f"  [ОП] {title}")
+            logger.info(f"[Catalog] Specialty: {title}")
         else:
-            print(f"  [~] Skipped: {title!r} ({url})")
+            logger.debug(f"[Catalog] Skipped: {title!r} ({url})")
 
         time.sleep(1)
 
     if not specialties:
-        print("  [!] No specialties found")
+        logger.warning("[Catalog] No specialties found")
         return 0
 
     lines = [
@@ -520,7 +495,7 @@ def build_specialties_catalog(collection_name: Optional[str] = None) -> int:
     )
 
     catalog_text = "\n".join(lines)
-    print(f"\n  Список специальностей ({len(specialties)} шт.):\n{catalog_text[:600]}")
+    logger.info(f"[Catalog] Specialties ({len(specialties)} total):\n{catalog_text[:600]}")
 
     embed_queries = [
         "какие специальности есть в ЦАИУ",
@@ -542,7 +517,7 @@ def build_specialties_catalog(collection_name: Optional[str] = None) -> int:
         embed_texts=embed_queries,
         collection_name=collection_name,
     )
-    print(f"  [Catalog] Specialties: {saved} vectors saved")
+    logger.info(f"[Catalog] Specialties: {saved} vectors saved")
     return saved
 
 
@@ -561,5 +536,5 @@ def build_and_save_catalog_chunks(collection_name: Optional[str] = None) -> int:
     total += build_faculties_catalog(collection_name=collection_name)
     total += build_departments_catalog(collection_name=collection_name)
     total += build_specialties_catalog(collection_name=collection_name)
-    print(f"\n[Catalog] All done. Total catalog vectors: {total}")
+    logger.info(f"[Catalog] All done. Total catalog vectors: {total}")
     return total

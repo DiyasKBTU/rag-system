@@ -113,6 +113,10 @@ async def _scheduler_loop() -> None:
     Фоновая корутина: проверяет расписание каждые 30 секунд.
     Если текущее время совпадает с запланированным — запускает горячую переиндексацию.
     Запускается один раз при старте FastAPI (в lifespan).
+
+    Поддерживает recurring (ежедневное повторение):
+      Если в расписании есть поле "recurring": true — после срабатывания
+      автоматически создаётся новое расписание на завтра в то же время.
     """
     logger.info("[Scheduler] Background scheduler started (checks every 30s)")
     while True:
@@ -128,6 +132,8 @@ async def _scheduler_loop() -> None:
                     # fired=True предотвращает повторный запуск при следующей проверке.
                     if now >= scheduled_dt and (now - scheduled_dt).total_seconds() <= 300:
                         logger.info(f"[Scheduler] Firing scheduled indexing at {scheduled_dt_str}")
+
+                        is_recurring = schedule.get("recurring", False)
                         schedule["fired"] = True
                         schedule["fired_at"] = datetime.now(timezone.utc).isoformat()
                         _write_schedule(schedule)
@@ -139,6 +145,31 @@ async def _scheduler_loop() -> None:
                             name="hot_swap_indexing",
                         )
                         t.start()
+
+                        # Если recurring — автоматически планируем следующий запуск
+                        if is_recurring:
+                            next_dt = scheduled_dt + timedelta(days=1)
+                            # Если следующее время уже прошло (сервис стоял >24ч) — переносим на сегодня+1
+                            if next_dt <= now:
+                                next_dt = now.replace(
+                                    hour=scheduled_dt.hour,
+                                    minute=scheduled_dt.minute,
+                                    second=0,
+                                    microsecond=0,
+                                ) + timedelta(days=1)
+
+                            next_schedule = {
+                                "scheduled_datetime": next_dt.isoformat(),
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "fired": False,
+                                "recurring": True,
+                            }
+                            _write_schedule(next_schedule)
+                            logger.info(
+                                f"[Scheduler] Recurring: next run scheduled for "
+                                f"{next_dt.strftime('%d.%m.%Y %H:%M')}"
+                            )
+
         except Exception as e:
             logger.error(f"[Scheduler] Error in scheduler loop: {e}")
 
@@ -275,12 +306,17 @@ class ScheduleRequest(BaseModel):
       "HH:MM"            — сегодня в это время (если прошло — завтра)
       "DD.MM HH:MM"      — конкретный день текущего года
       "DD.MM.YYYY HH:MM" — конкретный день с годом
+
+    Поле `recurring`:
+      True  — ежедневное повторение (автоматически планирует следующий запуск)
+      False — одноразово (по умолчанию)
     """
-    datetime: str  # например "03:00", "15.06 03:00", "15.06.2025 03:00"
+    datetime: str           # например "03:00", "15.06 03:00", "15.06.2025 03:00"
+    recurring: bool = False # True = ежедневно в это время
 
     class Config:
         json_schema_extra = {
-            "example": {"datetime": "15.06 03:00"}
+            "example": {"datetime": "03:00", "recurring": True}
         }
 
 
@@ -516,14 +552,16 @@ def schedule_index_endpoint(
         "scheduled_datetime": scheduled_dt.isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "fired": False,
+        "recurring": request.recurring,
     }
     _write_schedule(schedule_data)
 
     human_dt = scheduled_dt.strftime("%d.%m.%Y %H:%M")
-    logger.info(f"Indexing scheduled for {human_dt}")
+    recurring_note = " (ежедневно)" if request.recurring else ""
+    logger.info(f"Indexing scheduled for {human_dt}{recurring_note}")
 
     return ScheduleResponse(
-        message=f"Hot-swap indexing scheduled for {human_dt} (server local time). "
+        message=f"Hot-swap indexing scheduled for {human_dt} (server local time){recurring_note}. "
                 f"Cancel via DELETE /index/schedule.",
         scheduled_datetime=human_dt,
     )

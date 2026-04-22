@@ -214,7 +214,16 @@ def run_shadow_indexing() -> dict:
         shadow = get_shadow_collection_name()
         logger.info(f"[HotSwap] Shadow indexing started → '{shadow}'")
 
-        # Убеждаемся что теневая коллекция существует (создаём если надо)
+        # ── Очищаем теневую коллекцию перед индексацией ──────────
+        # Если предыдущий hot-swap упал на середине — там могут быть
+        # частичные данные старого прогона. Удаляем и пересоздаём чтобы
+        # гарантировать чистый старт. Это безопасно: shadow не активна.
+        client = get_client()
+        existing = [c.name for c in client.get_collections().collections]
+        if shadow in existing:
+            logger.info(f"[HotSwap] Clearing stale shadow collection '{shadow}'")
+            client.delete_collection(shadow)
+
         ensure_collection_exists(collection_name=shadow)
 
         # ── Индексируем в теневую коллекцию ──────────────────────

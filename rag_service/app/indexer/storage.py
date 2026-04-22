@@ -17,6 +17,7 @@ Flow:
   TextChunk -> get_embedding() -> save to Qdrant as Point
 """
 
+import logging
 import uuid
 import json
 from pathlib import Path
@@ -35,6 +36,8 @@ from qdrant_client.models import (
 from app.config import settings
 from app.parser.chunker import TextChunk
 from app.indexer.embeddings import get_embeddings_batch
+
+logger = logging.getLogger(__name__)
 
 # Файл состояния hot-swap: хранит имя активной коллекции
 # Путь: rag_service/hot_swap_state.json
@@ -115,7 +118,7 @@ def ensure_collection_exists(collection_name: Optional[str] = None) -> None:
     try:
         aliases = [a.alias_name for a in client.get_aliases().aliases]
         if _col in aliases:
-            print(f"[Qdrant] '{_col}' is an alias — skipping collection creation")
+            logger.info(f"[Qdrant] '{_col}' is an alias — skipping collection creation")
             return
     except Exception:
         pass  # Если get_aliases() не поддерживается — идём дальше
@@ -123,7 +126,7 @@ def ensure_collection_exists(collection_name: Optional[str] = None) -> None:
     existing = [c.name for c in client.get_collections().collections]
 
     if _col not in existing:
-        print(f"[Qdrant] Creating collection: {_col}")
+        logger.info(f"[Qdrant] Creating collection: {_col}")
         client.create_collection(
             collection_name=_col,
             vectors_config=VectorParams(
@@ -131,9 +134,9 @@ def ensure_collection_exists(collection_name: Optional[str] = None) -> None:
                 distance=Distance.COSINE,
             ),
         )
-        print(f"[Qdrant] Collection created successfully")
+        logger.info("[Qdrant] Collection created successfully")
     else:
-        print(f"[Qdrant] Collection already exists: {_col}")
+        logger.debug(f"[Qdrant] Collection already exists: {_col}")
 
 
 def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str,
@@ -142,14 +145,15 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str,
     Save list of chunks to Qdrant.
 
     Steps:
-    1. Delete old chunks for this URL (if page was re-indexed)
-    2. Create embeddings for all chunks in one batch
-    3. Save to Qdrant
+    1. Deduplicate chunks with identical text
+    2. Delete old chunks for this URL (if page was re-indexed)
+    3. Create embeddings for all chunks in one batch
+    4. Save to Qdrant
 
     Args:
-        chunks: List of TextChunk objects from chunker
-        page_url: URL of source page (used to delete old chunks)
-        content_hash: MD5 hash of page content (for change detection)
+        chunks:          List of TextChunk objects from chunker
+        page_url:        URL of source page (used to delete old chunks)
+        content_hash:    MD5 hash of page content (for change detection)
         collection_name: Target collection. Defaults to settings value.
 
     Returns:
@@ -159,7 +163,7 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str,
     if not chunks:
         return 0
 
-    # ── Дедупликация: убираем чанки с одинаковым текстом ──────
+    # ── Дедупликация: убираем чанки с одинаковым текстом ──────────
     # Некоторые страницы повторяют один и тот же HTML-блок несколько раз
     # (мобильная/десктопная версия, аккордеон-компоненты и т.д.)
     seen_texts: set = set()
@@ -172,19 +176,16 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str,
 
     duplicates = len(chunks) - len(unique_chunks)
     if duplicates > 0:
-        import logging
-        logging.getLogger(__name__).info(
-            f"[Storage] Removed {duplicates} duplicate chunks for {page_url}"
-        )
+        logger.info(f"[Storage] Removed {duplicates} duplicate chunks for {page_url}")
     chunks = unique_chunks
 
     client = get_client()
 
-    # ── Step 1: Delete old chunks for this URL ─────────────────
+    # ── Step 1: Delete old chunks for this URL ─────────────────────
     # This ensures we don't have duplicates if page is re-indexed
     delete_chunks_by_url(page_url, collection_name=_col)
 
-    # ── Step 2: Create vectors for all chunks at once ──────────
+    # ── Step 2: Create vectors for all chunks at once ───────────────
     # For question-chunks: embed the question (embed_text), not the body text.
     # This way the question vector is matched at search time,
     # but payload["text"] still holds the original chunk for GPT context.
@@ -192,43 +193,35 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str,
         chunk.embed_text if chunk.embed_text else chunk.text
         for chunk in chunks
     ]
-    print(f"  [Qdrant] Creating embeddings for {len(texts_for_embedding)} chunks...")
+    logger.info(f"[Storage] Creating embeddings for {len(texts_for_embedding)} chunks ({page_url})")
     vectors = get_embeddings_batch(texts_for_embedding)
 
     if len(vectors) != len(chunks):
-        print(f"  [!] Mismatch: {len(chunks)} chunks but {len(vectors)} vectors")
+        logger.error(
+            f"[Storage] Mismatch: {len(chunks)} chunks but {len(vectors)} vectors — skipping {page_url}"
+        )
         return 0
 
-    # ── Step 3: Build Qdrant points ────────────────────────────
+    # ── Step 3: Build Qdrant points ────────────────────────────────
     points = []
     for chunk, vector in zip(chunks, vectors):
-        point = PointStruct(
-            # Unique ID for each point (random UUID)
+        points.append(PointStruct(
             id=str(uuid.uuid4()),
-
-            # The vector (1536 numbers representing chunk meaning)
             vector=vector,
-
-            # Metadata stored alongside the vector
-            # This is what we return in search results
             payload={
-                "text": chunk.text,                     # actual chunk text
-                "page_url": chunk.page_url,             # source page URL
-                "page_title": chunk.page_title,         # page title
-                "section_title": chunk.section_title,   # section heading (h2/h3)
-                "chunk_index": chunk.index,             # position on page
-                "content_hash": content_hash,           # page hash (for updates)
+                "text":          chunk.text,
+                "embed_text":    chunk.embed_text or "",
+                "page_url":      chunk.page_url,
+                "page_title":    chunk.page_title,
+                "section_title": chunk.section_title,
+                "chunk_index":   chunk.index,
+                "content_hash":  content_hash,
             },
-        )
-        points.append(point)
+        ))
 
-    # ── Step 4: Save to Qdrant in one batch ───────────────────
-    client.upsert(
-        collection_name=_col,
-        points=points,
-    )
-
-    print(f"  [Qdrant] Saved {len(points)} chunks for: {page_url}")
+    # ── Step 4: Save to Qdrant in one batch ────────────────────────
+    client.upsert(collection_name=_col, points=points)
+    logger.info(f"[Storage] Saved {len(points)} chunks for: {page_url}")
     return len(points)
 
 
@@ -238,7 +231,7 @@ def delete_chunks_by_url(page_url: str, collection_name: Optional[str] = None) -
     Called before re-indexing a page to avoid duplicates.
 
     Args:
-        page_url: URL whose chunks to delete.
+        page_url:        URL whose chunks to delete.
         collection_name: Target collection. Defaults to settings value.
     """
     _col = collection_name or settings.QDRANT_COLLECTION_NAME
@@ -272,14 +265,14 @@ def get_collection_stats(collection_name: Optional[str] = None) -> dict:
         info = client.get_collection(_col)
         return {
             "total_chunks": info.points_count,
-            "collection": _col,
-            "status": info.status,
+            "collection":   _col,
+            "status":       info.status,
         }
     except Exception:
         return {
             "total_chunks": 0,
-            "collection": _col,
-            "status": "not_found",
+            "collection":   _col,
+            "status":       "not_found",
         }
 
 
@@ -290,18 +283,17 @@ def page_needs_update(page_url: str, new_hash: str,
     Compares the stored hash with the new hash.
 
     Args:
-        page_url: URL to check.
-        new_hash: Current MD5 hash of page content.
+        page_url:        URL to check.
+        new_hash:        Current MD5 hash of page content.
         collection_name: Collection to check. Defaults to settings value.
 
     Returns:
         True  - page changed, needs re-indexing
         False - page unchanged, skip it
     """
-    _col = collection_name or settings.QDRANT_COLLECTION_NAME
+    _col = collection_name or get_active_collection()
     client = get_client()
 
-    # Search for any chunk from this URL
     results = client.scroll(
         collection_name=_col,
         scroll_filter=Filter(
@@ -320,9 +312,7 @@ def page_needs_update(page_url: str, new_hash: str,
     points, _ = results
 
     if not points:
-        # No chunks for this URL - definitely needs indexing
-        return True
+        return True  # No chunks for this URL — needs indexing
 
-    # Compare hashes
     stored_hash = points[0].payload.get("content_hash", "")
     return stored_hash != new_hash

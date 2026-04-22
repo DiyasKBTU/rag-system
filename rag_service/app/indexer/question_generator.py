@@ -45,6 +45,7 @@ if sys.platform == "win32":
 
 from app.parser.chunker import TextChunk
 from app.config import settings
+from app.utils import detect_lang
 
 logger = logging.getLogger(__name__)
 
@@ -85,40 +86,61 @@ _USER_PROMPT_TEMPLATE_KK = """Білім базасынан мәтін:
 Әр сұрақ жаңа жолдан, нөмірсіз."""
 
 
-def _detect_lang(text: str) -> str:
-    """Определить язык чанка по казахским буквам."""
-    kk_chars = set("әғқңөұүһіӘҒҚҢӨҰҮҺІ")
-    return "kk" if sum(1 for ch in text if ch in kk_chars) > 3 else "ru"
+# detect_lang imported from app.utils — избегаем дублирования константы KAZAKH_CHARS
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def generate_question_chunks(chunks: List[TextChunk]) -> List[TextChunk]:
+def generate_question_chunks(
+    chunks: List[TextChunk],
+    questions_per_chunk: int = QUESTIONS_PER_CHUNK,
+) -> List[TextChunk]:
     """
     Generate question-chunks for a list of chunks.
 
     Runs parallel GPT calls internally (up to BATCH_CONCURRENCY at once).
     The function itself is synchronous — callers don't need to use asyncio.
 
-    For each chunk, calls GPT to get QUESTIONS_PER_CHUNK questions.
+    For each chunk, calls GPT to get `questions_per_chunk` questions.
     Returns a flat list of new TextChunk objects where:
       - text       = original chunk text (what GPT will receive as context)
       - embed_text = the generated question (what gets embedded for search)
       - All other fields copied from the original chunk
 
     These are saved alongside original chunks in Qdrant.
+
+    Args:
+        chunks:              список чанков для генерации вопросов
+        questions_per_chunk: сколько вопросов генерировать на чанк (по умолчанию 4)
+
+    Примечание: используем явно созданный event loop вместо asyncio.run(),
+    чтобы избежать конфликтов когда вызываем из потока (threading.Thread).
+    asyncio.run() поднимает RuntimeError если в текущем потоке уже есть
+    запущенный loop. Явный loop полностью изолирован.
     """
-    return asyncio.run(_generate_all_async(chunks))
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            _generate_all_async(chunks, questions_per_chunk=questions_per_chunk)
+        )
+    finally:
+        loop.close()
 
 
 # ── Internal async implementation ─────────────────────────────────────────────
 
-async def _generate_all_async(chunks: List[TextChunk]) -> List[TextChunk]:
+async def _generate_all_async(
+    chunks: List[TextChunk],
+    questions_per_chunk: int = QUESTIONS_PER_CHUNK,
+) -> List[TextChunk]:
     """Run all chunk question generation in parallel with a semaphore."""
     client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     semaphore = asyncio.Semaphore(BATCH_CONCURRENCY)
 
-    tasks = [_process_chunk(chunk, client, semaphore) for chunk in chunks]
+    tasks = [
+        _process_chunk(chunk, client, semaphore, n=questions_per_chunk)
+        for chunk in chunks
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_question_chunks: List[TextChunk] = []
@@ -148,6 +170,7 @@ async def _process_chunk(
     chunk: TextChunk,
     client: AsyncOpenAI,
     semaphore: asyncio.Semaphore,
+    n: int = QUESTIONS_PER_CHUNK,
 ) -> List[str]:
     """
     Generate questions for a single chunk, respecting the concurrency semaphore.
@@ -158,13 +181,13 @@ async def _process_chunk(
         return []
 
     # Выбираем промпт по языку чанка
-    lang = _detect_lang(chunk_text)
+    lang = detect_lang(chunk_text)
     system_prompt = _SYSTEM_PROMPT_KK if lang == "kk" else _SYSTEM_PROMPT_RU
     user_template = _USER_PROMPT_TEMPLATE_KK if lang == "kk" else _USER_PROMPT_TEMPLATE_RU
 
     prompt = user_template.format(
         chunk_text=chunk_text[:1500],  # limit input to save tokens
-        n=QUESTIONS_PER_CHUNK,
+        n=n,
     )
 
     async with semaphore:
@@ -187,4 +210,4 @@ async def _process_chunk(
         if len(line) >= 10 and "?" in line:
             questions.append(line)
 
-    return questions[:QUESTIONS_PER_CHUNK]
+    return questions[:n]

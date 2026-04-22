@@ -8,7 +8,7 @@ bot/run.py — Telegram-бот приёмной комиссии ЦАИУ.
 Что делает:
     1. Принимает вопрос от пользователя в Telegram
     2. Переводит на русский если вопрос на казахском или английском
-    3. Ищет ответ в RAG-сервисе (qdrant + embeddings)
+    3. Ищет ответ в RAG-сервисе (Qdrant + embeddings)
     4. Формирует ответ через GPT-4.1-mini
     5. Отправляет ответ пользователю на его языке
 
@@ -22,8 +22,11 @@ bot/run.py — Telegram-бот приёмной комиссии ЦАИУ.
 import asyncio
 import logging
 import os
+import sys
+import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+from pathlib import Path
 
 import httpx
 from aiogram import Bot, Dispatcher, Router, F
@@ -43,9 +46,9 @@ OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
 RAG_SERVICE_URL = os.getenv("RAG_SERVICE_URL", "http://localhost:8001")
 RAG_API_KEY     = os.environ["RAG_API_KEY"]
 
-def _setup_logging():
+
+def _setup_logging() -> None:
     """Логирование в stdout и в файл logs/bot_YYYY-MM-DD_HH-MM.log."""
-    from pathlib import Path
     from datetime import datetime
 
     logs_dir = Path(__file__).resolve().parent.parent / "rag_service" / "logs"
@@ -59,7 +62,7 @@ def _setup_logging():
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     for h in [logging.FileHandler(log_file, encoding="utf-8"),
-              logging.StreamHandler()]:
+              logging.StreamHandler(sys.stdout)]:
         h.setFormatter(fmt)
         root.addHandler(h)
 
@@ -67,6 +70,7 @@ def _setup_logging():
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     root.info(f"Bot logging started → {log_file}")
+
 
 _setup_logging()
 logger = logging.getLogger(__name__)
@@ -76,22 +80,25 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # ── Казахские буквы которых нет в русском ────────────────────────────────────
 # Если пользователь выбрал "kk" но написал по-русски — не переводим зря.
-_KAZAKH_CHARS = set("әғқңөұүһіӘҒҚҢӨҰҮҺІ")
+_KAZAKH_CHARS = frozenset("әғқңөұүһіӘҒҚҢӨҰҮҺІ")
 
 # ── Кеш переводов {(вопрос, lang): перевод_на_русском} ───────────────────────
-_translation_cache: dict = {}
+# OrderedDict + ограничение по размеру — простой LRU без зависимостей.
+# Максимум 500 записей: хватит на все частые вопросы, не съест память.
+_TRANSLATION_CACHE: OrderedDict = OrderedDict()
+_TRANSLATION_CACHE_MAX = 500
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
-# Максимум сообщений от одного пользователя за окно времени.
 # Защита от спама и случайного сжигания бюджета OpenAI.
 _RATE_LIMIT_MESSAGES = 10   # максимум сообщений
 _RATE_LIMIT_WINDOW   = 60   # за сколько секунд
 _RATE_LIMIT_COOLDOWN = 30   # сколько секунд ждать после превышения
 
-_user_timestamps: dict = defaultdict(list)  # {user_id: [timestamp, ...]}
+_user_timestamps: dict           = defaultdict(list)  # {user_id: [timestamp, ...]}
+_rate_limit_lock: threading.Lock = threading.Lock()   # защита от race condition
 
 # ── Отслеживание первого входа ────────────────────────────────────────────────
-# Пользователи которые уже видели приветствие — им показываем сразу выбор языка.
+# Пользователи которые уже видели приветствие.
 # Сбрасывается при перезапуске бота (это нормально, т.к. MemoryStorage тоже сбрасывается).
 _greeted_users: set = set()
 
@@ -102,33 +109,28 @@ LANGS = {
     "🇬🇧 English":  "en",
 }
 
-BACK_LABELS  = {"kk": "⬅ Артқа", "ru": "⬅ Назад", "en": "⬅ Back"}
-LANG_EMOJIS  = {"Қазақша 🇰🇿": "kk", "Русский 🇷🇺": "ru", "English 🇬🇧": "en"}
+BACK_LABELS = {"kk": "⬅ Артқа", "ru": "⬅ Назад", "en": "⬅ Back"}
 
 T = {
     # ── Экран приветствия (первый /start) ─────────────────────────────────────
-    # HTML-форматирование: <b>, <i>, поддерживается parse_mode="HTML"
     "greet": (
-        "🎓 <b>Қабылдау комиссиясы · Приёмная комиссия · Admissions Office</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🏛 <b>ОАИУ · ЦАИУ · CAIU</b>  |  Шымкент, Қазақстан\n\n"
-        "Сәлем! Мен — <b>Айдана</b>, сіздің виртуалды кеңесшіңіз.\n"
-        "Привет! Я — <b>Айдана</b>, ваш виртуальный консультант.\n"
-        "Hello! I'm <b>Aydana</b>, your virtual admissions guide.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ Мамандықтар / Специальности / Programs\n"
-        "✅ Оқу ақысы / Стоимость обучения / Tuition\n"
-        "✅ Грант · Қабылдау / Поступление / Admission\n"
-        "✅ Құжаттар / Документы / Documents\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        "🎓 <b>ЦАИУ · ОАИУ · CAIU</b>\n"
+        "📍 Шымкент, Казахстан\n\n"
+        "Добро пожаловать! Приёмная комиссия готова ответить на ваши вопросы.\n"
+        "Қош келдіңіз! Қабылдау комиссиясы сұрақтарыңызға жауап беруге дайын.\n"
+        "Welcome! The admissions office is ready to answer your questions.\n\n"
+        "✅ Специальности · Мамандықтар · Programs\n"
+        "✅ Стоимость · Оқу ақысы · Tuition\n"
+        "✅ Гранты · Гранттар · Grants\n"
+        "✅ Документы · Құжаттар · Documents"
     ),
-    # Короткий баннер для повторных /start (без громоздкого приветствия)
+    # Короткий баннер для повторных /start
     "greet_short": (
-        "🎓 <b>ОАИУ · ЦАИУ · CAIU</b> — Приёмная комиссия\n"
-        "Выберите язык для продолжения 👇"
+        "🎓 <b>ЦАИУ · ОАИУ · CAIU</b> — Приёмная комиссия\n"
+        "Выберите язык / Тілді таңдаңыз / Choose language 👇"
     ),
     "choose_lang": "🌐 <b>Тілді таңдаңыз / Выберите язык / Choose a language:</b>",
-    "ask_prompt":  {
+    "ask_prompt": {
         "kk": "✍️ <b>Сұрағыңызды жазыңыз:</b>",
         "ru": "✍️ <b>Напишите ваш вопрос:</b>",
         "en": "✍️ <b>Write your question:</b>",
@@ -155,17 +157,10 @@ T = {
     },
 }
 
-RAG_LABEL = {
-    "ru": {True: "🟢 <i>[из базы знаний]</i>",        False: "🔴 <i>[база знаний недоступна]</i>"},
-    "kk": {True: "🟢 <i>[білім базасынан]</i>",        False: "🔴 <i>[база қол жетімді емес]</i>"},
-    "en": {True: "🟢 <i>[from knowledge base]</i>",    False: "🔴 <i>[knowledge base unavailable]</i>"},
-}
-
 NO_INFO_SIGNALS = [
     "нет точной информации",
-    "нақты ақпарат жоқ",   # казахский вариант (было "нет нақты ақпарат" — неверно)
+    "нақты ақпарат жоқ",
     "don't have exact information",
-    "+7 707 510 10 10",
 ]
 
 _LANG_NAMES = {"kk": "Kazakh", "ru": "Russian", "en": "English"}
@@ -193,8 +188,9 @@ UNI = {
 class Chat(StatesGroup):
     waiting = State()
 
+
 # ── Клавиатуры ────────────────────────────────────────────────────────────────
-def lang_keyboard():
+def lang_keyboard() -> ReplyKeyboardMarkup:
     """Три кнопки языков — по одной в ряд для удобства нажатия."""
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=label)] for label in LANGS],
@@ -202,11 +198,13 @@ def lang_keyboard():
         one_time_keyboard=True,
     )
 
-def chat_keyboard(lang: str):
+
+def chat_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=BACK_LABELS[lang])]],
         resize_keyboard=True,
     )
+
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 def _is_rate_limited(user_id: int) -> bool:
@@ -214,21 +212,36 @@ def _is_rate_limited(user_id: int) -> bool:
     Проверяет не превысил ли пользователь лимит запросов.
     Возвращает True если нужно заблокировать сообщение.
 
-    Алгоритм: хранит временные метки последних сообщений пользователя.
-    Удаляет устаревшие (старше окна), считает оставшиеся.
+    Алгоритм: хранит временные метки последних сообщений.
+    Использует threading.Lock для защиты от race condition при concurrent запросах.
     """
     now = time.time()
-    timestamps = _user_timestamps[user_id]
+    with _rate_limit_lock:
+        _user_timestamps[user_id] = [
+            t for t in _user_timestamps[user_id]
+            if now - t < _RATE_LIMIT_WINDOW
+        ]
+        if len(_user_timestamps[user_id]) >= _RATE_LIMIT_MESSAGES:
+            return True
+        _user_timestamps[user_id].append(now)
+        return False
 
-    # Удаляем метки старше окна
-    _user_timestamps[user_id] = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW]
 
-    if len(_user_timestamps[user_id]) >= _RATE_LIMIT_MESSAGES:
-        return True
+# ── Кеш переводов (LRU) ───────────────────────────────────────────────────────
+def _cache_get(key: tuple) -> str | None:
+    """Возвращает закешированный перевод или None."""
+    if key in _TRANSLATION_CACHE:
+        _TRANSLATION_CACHE.move_to_end(key)
+        return _TRANSLATION_CACHE[key]
+    return None
 
-    # Записываем текущий запрос
-    _user_timestamps[user_id].append(now)
-    return False
+
+def _cache_set(key: tuple, value: str) -> None:
+    """Сохраняет перевод в кеш. Удаляет самый старый элемент при переполнении."""
+    _TRANSLATION_CACHE[key] = value
+    _TRANSLATION_CACHE.move_to_end(key)
+    while len(_TRANSLATION_CACHE) > _TRANSLATION_CACHE_MAX:
+        _TRANSLATION_CACHE.popitem(last=False)
 
 
 # ── RAG поиск ─────────────────────────────────────────────────────────────────
@@ -242,21 +255,40 @@ async def get_rag_context(question: str) -> str:
                 headers={"X-API-Key": RAG_API_KEY},
             )
             if resp.status_code == 200:
-                data = resp.json()
-                return data.get("context", "")
+                data    = resp.json()
+                context = data.get("context", "")
+                found   = data.get("total_found", 0)
+                logger.info(f"[RAG] OK — найдено чанков: {found}, контекст: {len(context)} симв.")
+                return context
+            elif resp.status_code == 401:
+                logger.error(
+                    "[RAG] 401 Unauthorized — неверный API ключ. "
+                    "Проверь RAG_API_KEY в .env и API_SECRET_KEY в rag_service/.env — они должны совпадать."
+                )
+            elif resp.status_code == 500:
+                logger.error(f"[RAG] 500 Server Error: {resp.text[:200]}")
+            else:
+                logger.warning(f"[RAG] Неожиданный статус {resp.status_code}: {resp.text[:200]}")
+    except httpx.TimeoutException:
+        logger.warning("[RAG] Таймаут запроса (>15s) — RAG-сервис не успел ответить")
+    except httpx.ConnectError:
+        logger.error(f"[RAG] Не удалось подключиться к {RAG_SERVICE_URL} — сервис не запущен?")
     except Exception as e:
         logger.warning(f"[RAG] Ошибка запроса: {e}")
     return ""
+
 
 # ── Перевод на русский ────────────────────────────────────────────────────────
 async def translate_to_russian(text: str, source_lang: str) -> str:
     """
     Переводит текст на русский через GPT.
-    Использует кеш: одинаковый вопрос переводится только один раз.
+    Использует LRU-кеш: одинаковый вопрос переводится только один раз.
+    Кеш ограничен 500 записями — не растёт бесконечно.
     """
     cache_key = (text, source_lang)
-    if cache_key in _translation_cache:
-        return _translation_cache[cache_key]
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     lang_name = "казахского" if source_lang == "kk" else "английского"
     try:
@@ -270,12 +302,13 @@ async def translate_to_russian(text: str, source_lang: str) -> str:
             max_tokens=200,
         )
         translated = resp.choices[0].message.content.strip()
-        _translation_cache[cache_key] = translated
+        _cache_set(cache_key, translated)
         logger.info(f"[Translate] [{source_lang}→ru]: '{text}' → '{translated}'")
         return translated
     except Exception as e:
         logger.warning(f"[Translate] Ошибка перевода: {e}")
         return text  # fallback: ищем оригинал
+
 
 # ── Генерация ответа через GPT ────────────────────────────────────────────────
 async def generate_answer(question: str, lang: str, context: str) -> tuple[str, bool]:
@@ -284,7 +317,7 @@ async def generate_answer(question: str, lang: str, context: str) -> tuple[str, 
     Возвращает (ответ, used_rag).
     """
     lang_name = _LANG_NAMES.get(lang, "Russian")
-    u = UNI.get(lang, UNI["ru"])   # название университета на языке пользователя
+    u = UNI.get(lang, UNI["ru"])  # название университета на языке пользователя
 
     lang_extra = ""
     if lang == "kk":
@@ -356,8 +389,6 @@ discount = жеңілдік | contract = контракт | academic year = уч
 Веди себя как живой консультант:
 1. Если вопрос РЯДОМ с темой в базе — ответь что знаешь из базы, и предложи
    уточнить детали у приёмной комиссии.
-   Пример: спросили про пороговый балл конкретной специальности, а в базе
-   только общие сведения → расскажи что знаешь об этой специальности и дай телефон.
 
 2. Если вопрос общий (как поступить, что такое ЕНТ) — можешь объяснить в общем,
    но в конце направь в приёмную комиссию для деталей.
@@ -373,9 +404,6 @@ discount = жеңілдік | contract = контракт | academic year = уч
 Когда пользователь спрашивает «какие специальности», «какие факультеты»,
 «перечисли направления» — перечисляй ТОЛЬКО то, что есть в базе знаний ниже.
 Не добавляй специальности или факультеты которых нет в базе.
-
-Если в базе знаний есть несколько источников с разными специальностями/
-факультетами — объедини их в один полный список (убери дубликаты).
 
 В конце такого ответа ОБЯЗАТЕЛЬНО добавь:
 «Полный актуальный список — на сайте caiu.edu.kz или по телефону 📞 +7 707 510 10 10»
@@ -409,18 +437,19 @@ discount = жеңілдік | contract = контракт | academic year = уч
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": question},
         ],
-        temperature=0.3,   # ниже температура = меньше галлюцинаций
+        temperature=0.3,
         max_tokens=700,
         top_p=0.9,
-        frequency_penalty=0.3,  # меньше повторов
+        frequency_penalty=0.3,
         presence_penalty=0.1,
     )
     answer = resp.choices[0].message.content.strip()
 
     is_no_info = any(signal in answer for signal in NO_INFO_SIGNALS)
-    used_rag = bool(context) and not is_no_info
+    used_rag   = bool(context) and not is_no_info
 
     return answer, used_rag
+
 
 # ── Основная логика обработки вопроса ─────────────────────────────────────────
 async def process_question(question: str, lang: str) -> tuple[str, bool]:
@@ -431,10 +460,7 @@ async def process_question(question: str, lang: str) -> tuple[str, bool]:
     3. GPT-ответ на языке пользователя
     Возвращает (ответ, used_rag).
     """
-    # Шаг 1: перевод на русский для поиска
     # kk — переводим ТОЛЬКО если есть казахские буквы (ә,ғ,қ,ң,ө,ұ,ү,һ,і).
-    #   Причина: казахские страницы содержат в основном навигацию, а не контент.
-    #   Основной контент — в русских чанках. Перевод даёт точный поиск.
     #   Если пользователь написал по-русски при kk-интерфейсе — не переводим.
     # en — всегда переводим.
     rag_question = question
@@ -445,38 +471,46 @@ async def process_question(question: str, lang: str) -> tuple[str, bool]:
     if needs_translation:
         rag_question = await translate_to_russian(question, lang)
 
-    # Шаг 2: поиск в RAG
     context = await get_rag_context(rag_question)
 
-    # Шаг 3: ответ
+    if context:
+        logger.info(f"[RAG] Контекст для GPT ({len(context)} симв.): {context[:300]}...")
+    else:
+        logger.warning(
+            f"[RAG] Контекст пустой — поиск не нашёл релевантных чанков "
+            f"для: '{rag_question[:80]}'"
+        )
+
     answer, used_rag = await generate_answer(question, lang, context)
     return answer, used_rag
+
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 router = Router()
 
+
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_id = message.from_user.id
     if user_id not in _greeted_users:
-        # Первый раз: красивое приветствие, затем сразу выбор языка
         _greeted_users.add(user_id)
         await message.answer(T["greet"], parse_mode="HTML")
         await message.answer(T["choose_lang"], parse_mode="HTML", reply_markup=lang_keyboard())
     else:
-        # Повторный /start: короткий баннер + выбор языка
         await message.answer(T["greet_short"], parse_mode="HTML", reply_markup=lang_keyboard())
 
+
 @router.message(StateFilter(None), F.text.in_(LANGS))
-async def select_language(message: Message, state: FSMContext):
+async def select_language(message: Message, state: FSMContext) -> None:
     lang = LANGS[message.text]
     await state.set_data({"lang": lang})
     await state.set_state(Chat.waiting)
     await message.answer(T["ask_prompt"][lang], parse_mode="HTML", reply_markup=chat_keyboard(lang))
 
+
 @router.message(Chat.waiting)
-async def handle_message(message: Message, state: FSMContext):
+async def handle_message(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     data = await state.get_data()
     lang = data.get("lang", "ru")
@@ -507,17 +541,20 @@ async def handle_message(message: Message, state: FSMContext):
 
     await message.answer(T["ask_more"][lang], reply_markup=chat_keyboard(lang))
 
+
 @router.message(StateFilter(None))
-async def fallback(message: Message, state: FSMContext):
+async def fallback(message: Message, state: FSMContext) -> None:
     await message.answer(T["greet_short"], parse_mode="HTML", reply_markup=lang_keyboard())
 
+
 # ── Запуск ────────────────────────────────────────────────────────────────────
-async def main():
+async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     logger.info("Бот запущен")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     try:

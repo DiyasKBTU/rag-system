@@ -20,7 +20,6 @@ import hashlib
 import logging
 from typing import List, Dict, Optional
 from dataclasses import dataclass
-from functools import lru_cache
 
 from rapidfuzz import process, fuzz
 
@@ -79,6 +78,7 @@ class SearchResult:
     page_title: str     # source page title
     chunk_index: int    # position of chunk on page
     score: float        # relevance score (0.0 to 1.0, higher = more relevant)
+    tags: list = None   # пользовательские теги (из ручного редактирования)
 
 
 # ── University-specific synonym dictionary ─────────────────────────────────────
@@ -361,18 +361,19 @@ SYNONYM_MAP: Dict[str, List[str]] = {
 
     # ─── Ректор / Руководство ────────────────────────────────────
     "ректор": [
-        "руководитель университета",
-        "ректор цаиу",
-        "глава университета",
+        "ректор цаиу фамилия имя",
+        "руководитель университета биография",
+        "глава университета фио",
         "руководство университета",
         "университет басшысы",
         "басшылық",
     ],
     "кто ректор": [
-        "ректор университета",
-        "руководитель вуза",
-        "ректор цаиу",
+        "ректор университета биография",
+        "ректор цаиу фио",
+        "руководитель вуза фамилия имя",
         "глава университета",
+        "ректор цаиу",
     ],
     "руководство": [
         "ректор",
@@ -935,12 +936,22 @@ def search(
                     continue
                 seen_ids.add(text_key)
 
+                # ── Фильтр мусорных чанков ─────────────────────────────────
+                # Пропускаем чанки короче 80 символов — это почти всегда
+                # заголовки страниц или навигационные блоки без реального содержания.
+                # Пример: "[вопросы и ответы (блог ректора)]\nвопросы и ответы..." —
+                # такой чанк содержит только название, а не ответ на вопрос.
+                if len(text.strip()) < 80:
+                    logger.debug(f"Filtered short chunk ({len(text)} chars): {text[:60]!r}")
+                    continue
+
                 result = SearchResult(
                     text=text,
                     page_url=payload.get("page_url", ""),
                     page_title=payload.get("page_title", ""),
                     chunk_index=payload.get("chunk_index", 0),
                     score=round(hit.score, 4),
+                    tags=payload.get("tags", []),
                 )
                 semantic_results.append(result)
 
