@@ -54,9 +54,10 @@ logger = logging.getLogger(__name__)
 QUESTIONS_PER_CHUNK = 4
 
 # Max parallel GPT requests.
-# 5 is conservative and safe for OpenAI tier-1 rate limits.
-# Raise to 10 if indexing feels slow and you see no 429 errors.
-BATCH_CONCURRENCY = 5
+# 10 параллельных запросов безопасны для OpenAI tier-1 (лимит ~60 RPM).
+# При большем количестве 429 начинают встречаться чаще — оставляем 10.
+# Если будут ошибки 429 — откатите до 5.
+BATCH_CONCURRENCY = 10
 
 # GPT prompts for question generation — по языку чанка
 _SYSTEM_PROMPT_RU = (

@@ -29,6 +29,19 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# ── Ограничитель конкурентных поисков ────────────────────────────────────────
+# Каждый поиск делает вызов к OpenAI Embeddings API.
+# При 50+ одновременных запросах OpenAI может вернуть 429 (rate limit).
+# Семафор ограничивает: максимум MAX_CONCURRENT_SEARCHES запросов к /search
+# одновременно могут идти в OpenAI; остальные ждут в очереди (не падают).
+#
+# Значение 20 выбрано исходя из:
+#   - OpenAI RPM лимит для text-embedding-3-small: обычно 3000 RPM = 50/сек
+#   - Средняя задержка поиска: ~1-2 сек → 20 * (1/1.5) ≈ 13 запросов/сек
+#   - Это с большим запасом для пикового потока абитуриентов
+MAX_CONCURRENT_SEARCHES = 20
+_search_semaphore = threading.Semaphore(MAX_CONCURRENT_SEARCHES)
+
 from app.logging_setup import setup_logging
 setup_logging("api")
 from typing import List, Optional
@@ -38,7 +51,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.config import settings
-from app.retrieval.search import search, format_results_as_context
+from app.retrieval.search import search, format_results_as_context, get_candidate_urls
 from app.indexer.storage import get_collection_stats, ensure_collection_exists
 
 
@@ -209,12 +222,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Allow cross-origin requests from any origin
+# RAG-сервис вызывается только ботом с того же хоста → ограничиваем CORS.
+# Если понадобится доступ с другого хоста (например, веб-панель на отдельном порту)
+# — добавьте нужный origin явно вместо "*".
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["http://localhost", "http://127.0.0.1",
+                   "http://localhost:8001", "http://127.0.0.1:8001"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["X-API-Key", "Content-Type"],
 )
 
 
@@ -259,6 +275,15 @@ class SearchResultItem(BaseModel):
     score: float       # Relevance score (0.0 to 1.0)
 
 
+class CandidateUrl(BaseModel):
+    """Страница-кандидат для показа когда бот не нашёл уверенного ответа."""
+    url: str
+    title: str
+    external_links: List[str] = []
+    # external_links — Google Docs, PDF и т.д. найденные на этой странице.
+    # Бот показывает их как прямые ссылки на документы.
+
+
 class SearchResponse(BaseModel):
     """Ответ /search — возвращается боту"""
     question: str
@@ -266,6 +291,7 @@ class SearchResponse(BaseModel):
     results: List[SearchResultItem]     # Raw chunks (for debugging)
     total_found: int                    # How many chunks found
     search_time_ms: int                 # How long search took
+    candidate_urls: List[CandidateUrl] = []  # Страницы-кандидаты (когда context пустой)
 
 
 class IndexRequest(BaseModel):
@@ -376,6 +402,17 @@ def search_endpoint(
 
     start_time = time.time()
 
+    # Ждём слота в семафоре (не более MAX_CONCURRENT_SEARCHES одновременно).
+    # Если свободных слотов нет — запрос блокируется здесь, но не падает.
+    # pool=5.0 в httpx клиенте бота тоже даёт backpressure со стороны клиента.
+    acquired = _search_semaphore.acquire(timeout=20.0)
+    if not acquired:
+        logger.warning("Search semaphore timeout — too many concurrent requests")
+        raise HTTPException(
+            status_code=503,
+            detail="Сервис перегружен, попробуйте через несколько секунд.",
+        )
+
     try:
         # Один вызов search() → форматируем готовые результаты.
         # format_results_as_context не вызывает search() повторно — нет двойных расходов.
@@ -385,6 +422,22 @@ def search_endpoint(
             min_score=request.min_score,
         )
         context = format_results_as_context(question, results) if results else ""
+
+        # Когда уверенного ответа нет — получаем страницы-кандидаты для показа в боте.
+        # Эмбеддинг уже в кеше после search() → дополнительного вызова OpenAI нет.
+        candidates = []
+        if not results:
+            raw_candidates = get_candidate_urls(question, top_k=3)
+            candidates = [
+                CandidateUrl(
+                    url=c["url"],
+                    title=c["title"],
+                    external_links=c.get("external_links", []),
+                )
+                for c in raw_candidates
+            ]
+            if candidates:
+                logger.info(f"No confident results, returning {len(candidates)} candidate URLs")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.info(f"Found {len(results)} chunks in {elapsed_ms}ms")
@@ -404,11 +457,14 @@ def search_endpoint(
             ],
             total_found=len(results),
             search_time_ms=elapsed_ms,
+            candidate_urls=candidates,
         )
 
     except Exception as e:
         logger.error(f"Search failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+    finally:
+        _search_semaphore.release()
 
 
 def _run_hot_swap_indexing():

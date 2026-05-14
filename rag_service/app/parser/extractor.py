@@ -17,10 +17,45 @@ import re
 import hashlib
 import httpx
 from bs4 import BeautifulSoup, Tag
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
 
 from app.config import settings
+
+
+# Домены которые считаем ценными внешними ресурсами (документы, файлы).
+# Ссылки на эти домены сохраняются в чанках и показываются в боте
+# когда RAG не нашёл уверенного ответа на вопрос.
+_VALUABLE_EXTERNAL_DOMAINS = (
+    "docs.google.com",
+    "drive.google.com",
+    "dropbox.com",
+    "onedrive.live.com",
+    "1drv.ms",
+    "disk.yandex",
+    "cloud.mail.ru",
+)
+
+# Паттерны URL которые всегда считаются ценными (независимо от домена)
+_VALUABLE_URL_PATTERNS = (
+    ".pdf",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+    "/download",
+    "/file",
+)
+
+# Домены которые игнорируем (соцсети, кнопки "поделиться" и т.д.)
+_IGNORE_DOMAINS = (
+    "facebook.com", "instagram.com", "twitter.com", "t.me",
+    "youtube.com", "youtu.be", "vk.com", "ok.ru",
+    "whatsapp.com", "telegram.me",
+    "fonts.google.com", "maps.google.com",
+    "w3.org", "schema.org", "mozilla.org",
+)
+
+SITE_DOMAIN = "caiu.edu.kz"
 
 
 @dataclass
@@ -30,6 +65,10 @@ class PageContent:
     title: str
     text: str
     content_hash: str
+    external_links: List[str] = field(default_factory=list)
+    # external_links — ценные внешние ссылки найденные на странице
+    # (Google Docs, PDF-файлы и т.д.). Сохраняются в Qdrant и
+    # возвращаются боту когда RAG не находит уверенного ответа.
 
 
 def download_page(url: str) -> Optional[str]:
@@ -80,6 +119,10 @@ def extract_text(url: str, html: str) -> PageContent:
 
     # ── Get page title ─────────────────────────────────────────
     title = _get_title(soup)
+
+    # ── Collect external links BEFORE stripping tags ───────────
+    # Важно делать до decompose(), иначе теги уже удалены.
+    external_links = _extract_external_links(soup, url)
 
     # ── Remove structural garbage (tags) ───────────────────────
     for tag in soup.find_all([
@@ -143,21 +186,31 @@ def extract_text(url: str, html: str) -> PageContent:
 
     clean = _clean_text(content_text or "")
 
+    # ── Content hash ────────────────────────────────────────────
+    # Считаем ДО добавления title, чтобы косметическое переименование
+    # заголовка страницы не вызывало ложную переиндексацию всего контента.
+    # (Баг #15: hash от текста с title — правка h1 = полная переиндексация)
+    content_hash = hashlib.md5(clean.encode("utf-8")).hexdigest()
+
     # ── Title injection ─────────────────────────────────────────
     # Prepend title to the content so that queries like "общежитие"
     # match a page titled "Студенческое общежитие" even if the body
     # text doesn't repeat the keyword prominently.
     if title and clean:
-        # Check if title is already in the first 100 chars of content
+        # Check if title is already in the first 200 chars of content
         if title.lower() not in clean[:200].lower():
             clean = f"{title}\n\n{clean}"
     elif title and not clean:
         # Page with almost no body text — at least index the title
         clean = title
 
-    content_hash = hashlib.md5(clean.encode("utf-8")).hexdigest()
-
-    return PageContent(url=url, title=title, text=clean, content_hash=content_hash)
+    return PageContent(
+        url=url,
+        title=title,
+        text=clean,
+        content_hash=content_hash,
+        external_links=external_links,
+    )
 
 
 def _extract_content_text(soup: BeautifulSoup) -> str:
@@ -291,6 +344,65 @@ def _inject_heading_markers(soup: BeautifulSoup) -> None:
         heading_text = tag.get_text(strip=True)
         if heading_text and 2 < len(heading_text) < 150:
             tag.replace_with(f"\n## {heading_text}\n")
+
+
+def _extract_external_links(soup: BeautifulSoup, base_url: str) -> List[str]:
+    """
+    Собирает ценные внешние ссылки со страницы.
+
+    «Ценная» — это:
+      1. Google Docs / Drive / Dropbox / OneDrive / Яндекс.Диск
+      2. Любой прямой .pdf / .docx / .xlsx файл
+    Внутренние ссылки caiu.edu.kz и мусорные домены (соцсети) игнорируются.
+
+    Зачем нужно:
+      Некоторые страницы не содержат текста сами по себе — они только
+      ссылаются на документ в Google Drive (например, правила приёма,
+      список документов, расписание). Если пользователь спрашивает об
+      этом документе, RAG не найдёт ответ в базе. Но мы можем показать
+      ссылку на сам документ, чтобы пользователь открыл его сам.
+    """
+    seen: set = set()
+    links: List[str] = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+
+        # Только абсолютные URL
+        if not href.startswith("http"):
+            continue
+
+        # Убираем внутренние ссылки сайта
+        if SITE_DOMAIN in href:
+            continue
+
+        href_lower = href.lower()
+
+        # Убираем мусорные домены
+        if any(bad in href_lower for bad in _IGNORE_DOMAINS):
+            continue
+
+        # Ценный домен или ценный паттерн URL
+        is_valuable = (
+            any(domain in href_lower for domain in _VALUABLE_EXTERNAL_DOMAINS)
+            or any(pat in href_lower for pat in _VALUABLE_URL_PATTERNS)
+        )
+
+        if not is_valuable:
+            continue
+
+        # Обрезаем tracking-параметры (utm_*, fbclid и т.д.)
+        clean_href = re.sub(r"\?(utm_|fbclid|gclid)[^\s]*", "", href)
+        clean_href = clean_href.rstrip("/")
+
+        if clean_href and clean_href not in seen:
+            seen.add(clean_href)
+            links.append(clean_href)
+
+        if len(links) >= 10:  # Не более 10 ссылок на страницу
+            break
+
+    return links
 
 
 def _get_title(soup: BeautifulSoup) -> str:

@@ -22,7 +22,7 @@ Key improvement: title prefix
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 from app.config import settings
@@ -38,12 +38,16 @@ class TextChunk:
     section_title: str = ""  # Section heading within the page (h2/h3/h4)
     embed_text: str = ""     # Text used for embedding (empty = use text).
                              # For question-chunks: embed_text=question, text=original chunk.
+    external_links: List[str] = field(default_factory=list)
+    # external_links — ценные внешние ссылки с этой страницы (Google Docs, PDF и т.д.).
+    # Сохраняются в Qdrant и возвращаются боту когда база не нашла уверенного ответа.
 
 
 def split_into_chunks(
     text: str,
     page_url: str = "",
     page_title: str = "",
+    external_links: List[str] = None,
 ) -> List[TextChunk]:
     """
     Split page text into chunks, respecting section boundaries.
@@ -108,6 +112,7 @@ def split_into_chunks(
                 page_url=page_url,
                 page_title=page_title,
                 section_title=section_title,
+                external_links=external_links or [],
             ))
             chunk_index += 1
 

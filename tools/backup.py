@@ -30,6 +30,7 @@ backup.py — Создать резервную копию базы знаний
 
 import os
 import sys
+import shutil
 import requests
 from datetime import datetime
 from pathlib import Path
@@ -38,19 +39,24 @@ os.chdir(os.path.join(os.path.dirname(__file__), "..", "rag_service"))
 sys.path.insert(0, ".")
 
 from app.config import settings
+from app.indexer.storage import get_active_collection
 
 
 # Папка для хранения бэкапов — рядом с корнем проекта
 BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
 
 QDRANT_BASE = f"http://{settings.QDRANT_HOST}:{settings.QDRANT_PORT}"
-COLLECTION  = settings.QDRANT_COLLECTION_NAME
+
+# После первого hot-swap settings.QDRANT_COLLECTION_NAME — это алиас, а не
+# реальная коллекция. get_active_collection() возвращает реальную (blue/green).
+COLLECTION  = get_active_collection()
 
 
 def main():
     print("\n" + "=" * 50)
     print("БЭКАП БАЗЫ ЗНАНИЙ")
     print("=" * 50)
+    print(f"\nАктивная коллекция: {COLLECTION}")
 
     # ── Шаг 1: проверить что Qdrant запущен ──────────────
     print("\n[1/4] Проверяю соединение с Qdrant...")
@@ -115,14 +121,37 @@ def main():
         print(f"      [✗] Ошибка при скачивании: {e}")
         sys.exit(1)
 
-    # ── Итог ─────────────────────────────────────────────
-    # Показать все бэкапы которые есть
     all_backups = sorted(BACKUP_DIR.glob("backup_*.snapshot"))
+
+    # ── Шаг 5: скопировать JSON-конфиги ──────────────────
+    # manual_knowledge.json содержит все ручные описания страниц и факты —
+    # их важно хранить вместе со снапшотом (они не попадают в Qdrant snapshot).
+    print("\n[5/5] Копирую JSON-конфиги...")
+
+    # Корень проекта — на два уровня выше tools/
+    project_root = Path(__file__).resolve().parent.parent
+    rag_service_dir = project_root / "rag_service"
+
+    json_configs = [
+        project_root / "manual_knowledge.json",
+    ]
+
+    backup_configs_dir = BACKUP_DIR / f"configs_{timestamp}"
+    backup_configs_dir.mkdir(exist_ok=True)
+
+    for cfg_path in json_configs:
+        if cfg_path.exists():
+            dest = backup_configs_dir / cfg_path.name
+            shutil.copy2(cfg_path, dest)
+            print(f"      [✓] {cfg_path.name} → {backup_configs_dir.name}/")
+        else:
+            print(f"      [–] {cfg_path.name} не найден (пропускаем)")
 
     print("\n" + "=" * 50)
     print("[✓] БЭКАП УСПЕШНО СОЗДАН")
     print("=" * 50)
     print(f"\nФайл: {save_path.name}")
+    print(f"Конфиги: {backup_configs_dir.name}/")
     print(f"Папка: {BACKUP_DIR}")
 
     if len(all_backups) > 1:
@@ -136,6 +165,8 @@ def main():
     print("  Откройте http://localhost:6333/dashboard")
     print(f"  Collections → {COLLECTION} → Snapshots → Upload")
     print(f"  Загрузите файл: {save_path.name}")
+    print(f"\nДля восстановления JSON-конфигов:")
+    print(f"  Скопируйте файлы из папки {backup_configs_dir.name}/ обратно в проект")
 
 
 if __name__ == "__main__":

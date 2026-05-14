@@ -16,8 +16,12 @@ time provides better recall than runtime keyword matching.
 
 import re
 import time
+import json
+import struct
 import hashlib
 import logging
+import threading
+import dataclasses
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 
@@ -26,48 +30,175 @@ from rapidfuzz import process, fuzz
 from app.indexer.storage import get_client
 from app.indexer.embeddings import get_embedding, get_embeddings_batch
 from app.config import settings
+from app.redis_client import get_redis, CACHE_TTL_SECONDS
 
 logger = logging.getLogger(__name__)
 
 
-# ── Кэш эмбеддингов ───────────────────────────────────────────────────────────
-# Хранит уже посчитанные векторы для одинаковых запросов.
-# Экономит ~300-500ms на повторных вопросах (частые: "как поступить", "стоимость").
-# maxsize=256 — хватит на все типичные запросы, не съест память.
+# ── Двухуровневый кэш эмбеддингов ────────────────────────────────────────────
+#
+# Уровень 1 — in-memory (dict):
+#   • Мгновенный доступ (<1мс)
+#   • Теряется при рестарте RAG-сервиса
+#   • maxsize=512 запросов
+#
+# Уровень 2 — Redis:
+#   • ~1-2мс доступ (localhost)
+#   • Переживает рестарт сервиса — не надо пересчитывать
+#   • TTL = 30 дней
+#   • Fallback: если Redis недоступен — работаем только с уровнем 1
+#
+# ВАЖНО: FastAPI sync endpoint работает в threadpool → Lock обязателен.
+#
 _EMBEDDING_CACHE: Dict[str, List[float]] = {}
-_CACHE_MAX_SIZE = 256
+_CACHE_MAX_SIZE = 512
+_CACHE_LOCK = threading.Lock()
+
+# Ожидаемая размерность вектора text-embedding-3-small
+_EXPECTED_EMBEDDING_DIM = 1536
+
+# Префикс ключей Redis для эмбеддингов
+_REDIS_EMB_PREFIX = "caiu:emb:"
+
+# Кеш полных ответов поиска в Redis
+# Ключ: "caiu:search:{md5(normalized_question)}"
+# TTL: 1 час — достаточно чтобы покрыть поток абитуриентов, но данные не устаревали после /reindex
+_REDIS_SEARCH_PREFIX = "caiu:search:"
+_SEARCH_CACHE_TTL    = 3600  # 1 час
+
+
+def _is_valid_vector(vector: List[float]) -> bool:
+    """
+    Проверяет что вектор корректный — не нулевой и правильной размерности.
+
+    Зачем: при временных ошибках OpenAI API может вернуть пустой или
+    нулевой вектор без исключения. Такой вектор даст нулевое косинусное
+    сходство со всеми чанками → поиск вернёт 0 результатов.
+    Некорректный вектор НЕ кешируем — при следующем запросе будет
+    сделана новая попытка получить правильный.
+    """
+    if not vector or len(vector) != _EXPECTED_EMBEDDING_DIM:
+        return False
+    # Нулевой вектор: все элементы ~0.0
+    if all(abs(v) < 1e-9 for v in vector[:10]):
+        return False
+    return True
+
+
+def _vector_to_bytes(vector: List[float]) -> bytes:
+    """Сериализует вектор float32 в байты для хранения в Redis."""
+    return struct.pack(f"{len(vector)}f", *vector)
+
+
+def _bytes_to_vector(data: bytes) -> List[float]:
+    """Десериализует байты из Redis обратно в список float."""
+    count = len(data) // 4  # float32 = 4 байта
+    return list(struct.unpack(f"{count}f", data))
+
+
+def _redis_get_vector(key: str) -> Optional[List[float]]:
+    """Пробует получить вектор из Redis. Возвращает None при ошибке или промахе."""
+    r = get_redis()
+    if r is None:
+        return None
+    try:
+        data = r.get(_REDIS_EMB_PREFIX + key)
+        if data:
+            return _bytes_to_vector(data)
+    except Exception as e:
+        logger.debug(f"[Redis] get failed: {e}")
+    return None
+
+
+def _redis_set_vector(key: str, vector: List[float]) -> None:
+    """Сохраняет вектор в Redis с TTL. Молча игнорирует ошибки."""
+    r = get_redis()
+    if r is None:
+        return
+    try:
+        r.set(_REDIS_EMB_PREFIX + key, _vector_to_bytes(vector), ex=CACHE_TTL_SECONDS)
+    except Exception as e:
+        logger.debug(f"[Redis] set failed: {e}")
+
+
+def _cache_put(key: str, vector: List[float]) -> None:
+    """Записывает вектор в in-memory кеш (thread-safe, с eviction)."""
+    with _CACHE_LOCK:
+        if len(_EMBEDDING_CACHE) >= _CACHE_MAX_SIZE:
+            try:
+                _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
+            except StopIteration:
+                pass
+        _EMBEDDING_CACHE[key] = vector
 
 
 def _get_embedding_cached(text: str) -> List[float]:
-    """Возвращает вектор из кэша, если он там есть, иначе запрашивает у OpenAI."""
+    """
+    Возвращает вектор из кэша (in-memory → Redis → OpenAI).
+    Пишет в оба уровня кеша при промахе.
+    """
     key = hashlib.md5(text.encode()).hexdigest()
-    if key not in _EMBEDDING_CACHE:
-        if len(_EMBEDDING_CACHE) >= _CACHE_MAX_SIZE:
-            # Удаляем первый (самый старый) ключ
-            _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
-        _EMBEDDING_CACHE[key] = get_embedding(text)
-    return _EMBEDDING_CACHE[key]
+
+    # Уровень 1: in-memory
+    with _CACHE_LOCK:
+        if key in _EMBEDDING_CACHE:
+            return _EMBEDDING_CACHE[key]
+
+    # Уровень 2: Redis
+    vector = _redis_get_vector(key)
+    if vector and _is_valid_vector(vector):
+        _cache_put(key, vector)  # прогреваем in-memory
+        return vector
+
+    # Уровень 3: OpenAI (вне лока — сетевой вызов)
+    vector = get_embedding(text)
+    if not _is_valid_vector(vector):
+        logger.warning(f"[Cache] Некорректный вектор для '{text[:50]}' — не кешируем")
+        return vector
+
+    _cache_put(key, vector)
+    _redis_set_vector(key, vector)
+    return vector
 
 
 def _get_embeddings_batch_cached(texts: List[str]) -> List[List[float]]:
     """
-    Пакетно получает эмбеддинги, используя кэш.
-    Отправляет к OpenAI ТОЛЬКО те тексты, которых нет в кэше.
+    Пакетно получает эмбеддинги через двухуровневый кеш.
+    Порядок поиска для каждого текста: in-memory → Redis → OpenAI.
+    Один батч-запрос к OpenAI только для тех текстов, что не найдены нигде.
+    Thread-safe: критические секции защищены _CACHE_LOCK.
     """
     keys = [hashlib.md5(t.encode()).hexdigest() for t in texts]
-    missing_indices = [i for i, k in enumerate(keys) if k not in _EMBEDDING_CACHE]
 
-    if missing_indices:
-        missing_texts = [texts[i] for i in missing_indices]
+    # ── Уровень 1: in-memory ──────────────────────────────────────
+    with _CACHE_LOCK:
+        cached = {k: _EMBEDDING_CACHE[k] for k in keys if k in _EMBEDDING_CACHE}
+
+    # ── Уровень 2: Redis (для промахов in-memory) ─────────────────
+    still_missing = [i for i, k in enumerate(keys) if k not in cached]
+    for i in still_missing[:]:  # копия чтобы безопасно убирать
+        vector = _redis_get_vector(keys[i])
+        if vector and _is_valid_vector(vector):
+            _cache_put(keys[i], vector)   # прогреваем in-memory
+            cached[keys[i]] = vector
+            still_missing.remove(i)
+
+    # ── Уровень 3: OpenAI (только то что нет нигде) ───────────────
+    if still_missing:
+        missing_texts = [texts[i] for i in still_missing]
         # Один батч-запрос вместо N отдельных — главная оптимизация скорости
         new_vectors = get_embeddings_batch(missing_texts)
-        for i, vector in zip(missing_indices, new_vectors):
-            key = keys[i]
-            if len(_EMBEDDING_CACHE) >= _CACHE_MAX_SIZE:
-                _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
-            _EMBEDDING_CACHE[key] = vector
 
-    return [_EMBEDDING_CACHE[k] for k in keys]
+        for i, vector in zip(still_missing, new_vectors):
+            if not _is_valid_vector(vector):
+                logger.warning(f"[Cache] Некорректный вектор для варианта #{i} — не кешируем")
+                cached[keys[i]] = vector  # используем, но не кешируем
+                continue
+            _cache_put(keys[i], vector)
+            _redis_set_vector(keys[i], vector)
+            cached[keys[i]] = vector
+
+    return [cached[k] for k in keys]
 
 
 @dataclass
@@ -710,7 +841,11 @@ def _expand_query(query: str) -> List[str]:
     extra_queries = []
 
     # ── Шаг 1: точное подстроковое совпадение ────────────────────
-    for keyword, synonyms in SYNONYM_MAP.items():
+    # Ключи сортируются по убыванию длины: "документы для общежития" (24 символа)
+    # проверяется раньше чем "документы" (9 символов) — иначе составной запрос
+    # ошибочно матчится на короткий ключ и получает нерелевантные синонимы.
+    for keyword in sorted(SYNONYM_MAP.keys(), key=len, reverse=True):
+        synonyms = SYNONYM_MAP[keyword]
         if keyword in query_lower:
             for syn in synonyms[:2]:
                 if syn not in extra_queries and syn != query_lower:
@@ -740,19 +875,25 @@ def _deduplicate_results(
 ) -> List[SearchResult]:
     """
     Deduplicate search results:
-    1. Remove exact text duplicates (from multi-query overlap)
+    1. Remove duplicate chunks by (page_url, chunk_index) — точный идентификатор чанка
     2. Limit to max_per_page chunks per source page (prevent one page flooding context)
+
+    Почему (page_url, chunk_index) вместо text[:200]:
+      Чанки с одной страницы часто начинаются одинаково: "[Страница > Раздел]\n..."
+      Первые 200 символов у них совпадают → text[:200] считает их одним чанком
+      и выбрасывает разные по содержанию блоки.
+      (page_url, chunk_index) — точная пара, уникальная для каждого чанка.
     """
-    seen_texts = set()
+    seen_ids: set = set()
     page_count: Dict[str, int] = {}
     deduped = []
 
     for r in results:
-        # Skip exact text duplicate
-        text_key = r.text[:200]  # compare first 200 chars to catch near-duplicates
-        if text_key in seen_texts:
+        # Точный идентификатор чанка — не пропустим разные блоки с похожим началом
+        chunk_id = (r.page_url, r.chunk_index)
+        if chunk_id in seen_ids:
             continue
-        seen_texts.add(text_key)
+        seen_ids.add(chunk_id)
 
         # Limit per page
         page_count[r.page_url] = page_count.get(r.page_url, 0) + 1
@@ -861,14 +1002,30 @@ def search(
     if min_score is None:
         min_score = settings.SIMILARITY_THRESHOLD
 
-    # ── Step 1: Normalize query ───────────────────────────────
+    # ── Step 0: Normalize query ───────────────────────────────
     question = _normalize_query(question)
     if not question:
         return []
 
-    # ── Step 2: Detect «catalog» mode ────────────────────────
-    # Для вопросов о специальностях / факультетах увеличиваем все лимиты,
-    # чтобы GPT видел полный список, а не первые 5 совпадений.
+    # ── Step 0.5: Redis search cache ─────────────────────────
+    # Повторяющиеся запросы ("как поступить", "общежитие") отвечают мгновенно
+    # без embedding-запроса к OpenAI и без обращения к Qdrant.
+    # TTL = 1 час: данные не устаревают между запросами абитуриентов,
+    # но после /reindex (30-60 мин) кеш естественно обновится.
+    _cache_key = _REDIS_SEARCH_PREFIX + hashlib.md5(question.encode()).hexdigest()
+    r = get_redis()
+    if r is not None:
+        try:
+            cached_raw = r.get(_cache_key)
+            if cached_raw:
+                cached_list = json.loads(cached_raw)
+                results = [SearchResult(**item) for item in cached_list]
+                logger.debug(f"[SearchCache] HIT for '{question[:60]}'")
+                return results
+        except Exception as e:
+            logger.debug(f"[SearchCache] Read failed: {e}")
+
+    # ── Step 1: Detect «catalog» mode ────────────────────────
     catalog_mode = _is_list_query(question)
     if catalog_mode:
         top_k           = max(top_k, LIST_TOP_K)
@@ -887,7 +1044,7 @@ def search(
         qdrant_threshold    = min_score          # стандартный порог из config
         min_confident_score = settings.MIN_CONFIDENT_SCORE
 
-    # ── Step 3: Expand query into variants ────────────────────
+    # ── Step 2: Expand query into variants ────────────────────
     query_variants = _expand_query(question)
     logger.debug(f"Query variants: {query_variants}")
 
@@ -929,12 +1086,13 @@ def search(
 
             for hit in hits:
                 payload = hit.payload or {}
-                # Use text as dedup key (avoid same chunk from multiple queries)
                 text = payload.get("text", "")
-                text_key = text[:200]
-                if text_key in seen_ids:
+                # Дедупликация по (page_url, chunk_index) — один чанк может прийти
+                # от нескольких вариантов запроса (query expansion); берём его один раз.
+                chunk_id = (payload.get("page_url", ""), payload.get("chunk_index", -1))
+                if chunk_id in seen_ids:
                     continue
-                seen_ids.add(text_key)
+                seen_ids.add(chunk_id)
 
                 # ── Фильтр мусорных чанков ─────────────────────────────────
                 # Пропускаем чанки короче 80 символов — это почти всегда
@@ -1002,6 +1160,15 @@ def search(
         f"after_gap={len(filtered)}, after_dedup={len(deduped)}, final={len(final)}"
     )
 
+    # ── Запись в Redis-кеш ────────────────────────────────────
+    if r is not None and final:
+        try:
+            payload = json.dumps([dataclasses.asdict(res) for res in final], ensure_ascii=False)
+            r.set(_cache_key, payload, ex=_SEARCH_CACHE_TTL)
+            logger.debug(f"[SearchCache] WRITE for '{question[:60]}' ({len(final)} results, TTL {_SEARCH_CACHE_TTL}s)")
+        except Exception as e:
+            logger.debug(f"[SearchCache] Write failed: {e}")
+
     return final
 
 
@@ -1053,13 +1220,62 @@ def format_results_as_context(question: str, results: List[SearchResult]) -> str
     return "\n\n".join(context_parts)
 
 
-def search_and_format_context(question: str) -> str:
+def get_candidate_urls(question: str, top_k: int = 3) -> list[dict]:
     """
-    Search for relevant chunks and format them as context for ChatGPT.
+    Возвращает top-N наиболее релевантных URL для вопроса — без фильтрации по порогу.
 
-    Вызывает search() и format_results_as_context() последовательно.
-    Используется только там где нет готовых результатов.
-    Если результаты уже есть — используй format_results_as_context() напрямую.
+    Используется как fallback когда search() вернул [] (ответ не найден):
+    бот показывает ссылки «возможно, здесь есть информация» вместо
+    голого «позвоните по телефону».
+
+    Преимущества:
+    - Эмбеддинг берётся из кеша (нет повторного вызова OpenAI)
+    - Qdrant-запрос с низким порогом (0.10) даёт кандидатов даже для off-topic вопросов
+    - Дедупликация по URL — один URL попадёт только один раз
+
+    Args:
+        question:  Тот же вопрос, что передавался в search()
+        top_k:     Сколько URL вернуть (по умолчанию 3)
+
+    Returns:
+        list of {"url": str, "title": str}  — отсортированы по релевантности.
+        Пустой список если Qdrant недоступен или нет результатов вообще.
     """
-    results = search(question)
-    return format_results_as_context(question, results)
+    try:
+        # Эмбеддинг берётся из двухуровневого кеша → обычно 0 доп. вызовов OpenAI
+        vectors = _get_embeddings_batch_cached([question])
+        if not vectors or not _is_valid_vector(vectors[0]):
+            return []
+
+        qdrant = get_client()
+        hits = qdrant.search(
+            collection_name=settings.QDRANT_COLLECTION_NAME,
+            query_vector=vectors[0],
+            limit=top_k * 4,    # берём с запасом для дедупликации по URL
+            score_threshold=0.10,
+            with_payload=True,
+        )
+
+        seen_urls: set = set()
+        candidates = []
+        for hit in hits:
+            payload = hit.payload or {}
+            url            = payload.get("page_url", "")
+            title          = payload.get("page_title", "") or url
+            external_links = payload.get("external_links", []) or []
+
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                candidates.append({
+                    "url":            url,
+                    "title":          title,
+                    "external_links": external_links,
+                })
+                if len(candidates) >= top_k:
+                    break
+
+        return candidates
+
+    except Exception as e:
+        logger.debug(f"[Candidates] get_candidate_urls failed: {e}")
+        return []

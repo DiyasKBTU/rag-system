@@ -71,6 +71,7 @@ venv.bak/
 
 # Кэшы
 .pytest_cache/
+pytest-cache-files-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -100,6 +101,12 @@ bm25_index.pkl
 *.pkl
 *.npy
 *.npz
+
+# ── Runtime state файлы (создаются автоматически, не в git) ──────────────────
+rag_service/hot_swap_state.json
+rag_service/hot_swap_state.tmp
+rag_service/schedule_state.json
+rag_service/fetch_cache.pkl
 
 # ── Курсорные файлы ───────────────────────────────────────────────────────────
 .cursorignore

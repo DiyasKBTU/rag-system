@@ -16,18 +16,23 @@ catalog_builder.py — Построитель сводных чанков для
     python tools/rebuild_catalog.py
 """
 
+import json
 import logging
 import re
 import hashlib
 import uuid
 import time
+from pathlib import Path
 from typing import List, Tuple, Optional
+
+# Файл ручной базы знаний — в корне проекта (на 4 уровня выше catalog_builder.py)
+_MANUAL_KNOWLEDGE_FILE = Path(__file__).resolve().parent.parent.parent.parent / "manual_knowledge.json"
 
 from qdrant_client.models import PointStruct
 
 from app.config import settings
 from app.indexer.embeddings import get_embeddings_batch
-from app.indexer.storage import get_client, delete_chunks_by_url
+from app.indexer.storage import get_client, delete_chunks_by_url, page_needs_update
 from app.utils import KAZAKH_CHARS
 
 logger = logging.getLogger(__name__)
@@ -81,11 +86,18 @@ def _is_valid_heading(text: str) -> bool:
     return True
 
 
-def _get_page_content(url: str):
+def _get_page_content(url: str, pages_cache: Optional[dict] = None):
     """
-    Использует наш extractor для скачивания и очистки страницы.
-    Возвращает PageContent или None.
+    Возвращает PageContent для URL.
+
+    Если pages_cache передан (dict {url: PageContent}) и URL уже там —
+    берём из кеша без HTTP-запроса. Это устраняет повторное скачивание
+    тех же страниц которые pipeline уже скачал в фазе 1 (Bug #3).
     """
+    if pages_cache and url in pages_cache:
+        cached = pages_cache[url]
+        if cached is not None:
+            return cached
     try:
         from app.parser.extractor import get_page_content
         return get_page_content(url)
@@ -168,11 +180,24 @@ def _save_synthetic_chunk(
     embed_texts: List[str],
     collection_name: Optional[str] = None,
 ) -> int:
-    """Сохраняет синтетический чанк в Qdrant (один текст, N векторов)."""
+    """
+    Сохраняет синтетический чанк в Qdrant (один текст, N векторов).
+
+    Bug #5: если content_hash не изменился с прошлой индексации —
+    пропускаем embeddings и upsert. Экономит OpenAI-запросы когда
+    каталог не менялся (типичный случай при /reindex без изменений на сайте).
+    """
     if not text or not embed_texts:
         return 0
 
     _col = collection_name or settings.QDRANT_COLLECTION_NAME
+    content_hash = hashlib.md5(text.encode()).hexdigest()
+
+    # Skip if already saved with the same content hash (Bug #5)
+    if not page_needs_update(virtual_url, content_hash, collection_name=_col):
+        logger.info(f"[Catalog] Skipped (not changed): {page_title}")
+        return 0
+
     client = get_client()
     delete_chunks_by_url(virtual_url, collection_name=_col)
 
@@ -184,8 +209,6 @@ def _save_synthetic_chunk(
 
     if len(vectors) != len(embed_texts):
         return 0
-
-    content_hash = hashlib.md5(text.encode()).hexdigest()
 
     points = []
     for embed_text, vector in zip(embed_texts, vectors):
@@ -222,19 +245,26 @@ FACULTY_URLS = [
 ]
 
 
-def build_faculties_catalog(collection_name: Optional[str] = None) -> int:
+def build_faculties_catalog(
+    collection_name: Optional[str] = None,
+    pages_cache: Optional[dict] = None,
+) -> int:
     """
     4 факультета ЦАИУ.
     Скачивает каждую страницу факультета, берёт h1 как название.
+
+    pages_cache: dict {url: PageContent} из pipeline._fetch_all_pages().
+    Если URL уже в кеше — не скачиваем повторно (Bug #3).
     """
     logger.info("[Catalog] Building faculties catalog...")
     faculties: List[str] = []
 
     for url in FACULTY_URLS:
-        content = _get_page_content(url)
+        content = _get_page_content(url, pages_cache=pages_cache)
         if not content:
             logger.warning(f"[Catalog] Could not fetch: {url}")
-            time.sleep(1)
+            if not (pages_cache and url in pages_cache):
+                time.sleep(1)
             continue
 
         title = _normalize(content.title or content.text.split("\n")[0].strip())
@@ -245,7 +275,8 @@ def build_faculties_catalog(collection_name: Optional[str] = None) -> int:
         else:
             logger.warning(f"[Catalog] Bad faculty title '{title}': {url}")
 
-        time.sleep(1)
+        if not (pages_cache and url in pages_cache):
+            time.sleep(1)
 
     if not faculties:
         logger.warning("[Catalog] No faculties found")
@@ -310,7 +341,10 @@ DEPARTMENT_URLS = [
 ]
 
 
-def build_departments_catalog(collection_name: Optional[str] = None) -> int:
+def build_departments_catalog(
+    collection_name: Optional[str] = None,
+    pages_cache: Optional[dict] = None,
+) -> int:
     """
     Кафедры и их образовательные программы.
 
@@ -318,6 +352,8 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
     1. СВОДНЫЙ — список всех 10 кафедр с ОП (вопросы: "какие кафедры", "сколько кафедр")
     2. ОТДЕЛЬНЫЙ на каждую кафедру — её название + ОП-коды
        (вопросы: "какие ОП в кафедре бизнеса", "специальности кафедры права")
+
+    pages_cache: если передан pipeline-кеш уже скачанных страниц — не скачиваем повторно.
     """
     logger.info(f"[Catalog] Building departments catalog ({len(DEPARTMENT_URLS)} pages)...")
 
@@ -325,10 +361,11 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
     total_saved = 0
 
     for url in DEPARTMENT_URLS:
-        content = _get_page_content(url)
+        content = _get_page_content(url, pages_cache=pages_cache)
         if not content:
             logger.warning(f"[Catalog] Could not fetch: {url}")
-            time.sleep(1)
+            if not (pages_cache and url in pages_cache):
+                time.sleep(1)
             continue
 
         name = _normalize(content.title)
@@ -338,7 +375,8 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
 
         if not name or len(name) < 4:
             logger.warning(f"[Catalog] No usable title: {url}")
-            time.sleep(1)
+            if not (pages_cache and url in pages_cache):
+                time.sleep(1)
             continue
 
         ops = _extract_op_lines(content.text)
@@ -377,7 +415,8 @@ def build_departments_catalog(collection_name: Optional[str] = None) -> int:
             collection_name=collection_name,
         )
         total_saved += saved
-        time.sleep(0.5)
+        if not (pages_cache and url in pages_cache):
+            time.sleep(0.5)
 
     if not dept_entries:
         logger.warning("[Catalog] No departments fetched!")
@@ -455,19 +494,25 @@ SPECIALTY_URLS = [
 ]
 
 
-def build_specialties_catalog(collection_name: Optional[str] = None) -> int:
+def build_specialties_catalog(
+    collection_name: Optional[str] = None,
+    pages_cache: Optional[dict] = None,
+) -> int:
     """
     Список специальностей (образовательных программ) бакалавриата.
     Берём h1 с каждой страницы специальности.
+
+    pages_cache: если передан pipeline-кеш уже скачанных страниц — не скачиваем повторно.
     """
     logger.info("[Catalog] Building specialties catalog...")
     specialties: List[str] = []
 
     for url in SPECIALTY_URLS:
-        content = _get_page_content(url)
+        content = _get_page_content(url, pages_cache=pages_cache)
         if not content:
             logger.warning(f"[Catalog] Could not fetch: {url}")
-            time.sleep(1)
+            if not (pages_cache and url in pages_cache):
+                time.sleep(1)
             continue
 
         title = _normalize(content.title)
@@ -477,7 +522,8 @@ def build_specialties_catalog(collection_name: Optional[str] = None) -> int:
         else:
             logger.debug(f"[Catalog] Skipped: {title!r} ({url})")
 
-        time.sleep(1)
+        if not (pages_cache and url in pages_cache):
+            time.sleep(1)
 
     if not specialties:
         logger.warning("[Catalog] No specialties found")
@@ -522,19 +568,155 @@ def build_specialties_catalog(collection_name: Optional[str] = None) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MANUAL KNOWLEDGE — ручная база знаний
+#
+# Все записи хранятся в manual_knowledge.json (корень проекта).
+# Виртуальный URL каждой записи: https://caiu.edu.kz/__manual__/{id}
+# Этот URL никогда не показывается пользователю.
+#
+# Два типа записей:
+#   - С полем link: страница с картинкой/файлом/формой.
+#     link добавляется в текст (GPT цитирует) и в external_links (бот показывает).
+#   - Без link: голый факт — GPT отвечает без ссылки на конкретную страницу.
+#
+# Добавить новую запись:
+#   1. Открыть manual_knowledge.json
+#   2. Добавить объект в массив "entries"
+#   3. Запустить: python tools/rebuild_manual_knowledge.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_manual_knowledge_catalog(collection_name: Optional[str] = None) -> int:
+    """
+    Создаёт синтетические чанки из manual_knowledge.json.
+
+    Два типа записей:
+    - С link: страница-картинка / файл / форма.
+      link сохраняется в external_links и добавляется в текст для GPT.
+    - Без link: фактические данные без привязки к конкретной странице.
+
+    Виртуальный URL: https://caiu.edu.kz/__manual__/{id}
+    """
+    if not _MANUAL_KNOWLEDGE_FILE.exists():
+        logger.info("[Catalog] manual_knowledge.json not found — skipping manual knowledge")
+        return 0
+
+    try:
+        data    = json.loads(_MANUAL_KNOWLEDGE_FILE.read_text(encoding="utf-8"))
+        entries = data.get("entries", [])
+    except Exception as e:
+        logger.error(f"[Catalog] Cannot read manual_knowledge.json: {e}")
+        return 0
+
+    if not entries:
+        logger.info("[Catalog] manual_knowledge.json has no entries — skipping")
+        return 0
+
+    logger.info(f"[Catalog] Building manual knowledge ({len(entries)} entries)...")
+    _col   = collection_name or settings.QDRANT_COLLECTION_NAME
+    client = get_client()
+    total_saved = 0
+
+    for entry in entries:
+        # Пропускаем технические комментарии (_note и т.д.)
+        entry_id = (entry.get("id") or "").strip()
+        title    = (entry.get("title") or "").strip()
+        link     = (entry.get("link") or "").strip() or None
+        chunks   = entry.get("chunks") or []
+
+        if not entry_id or not chunks:
+            continue  # _note-записи или незаполненные шаблоны
+
+        virtual_url = f"https://caiu.edu.kz/__manual__/{entry_id}"
+
+        # Удаляем старые чанки перед пересохранением
+        delete_chunks_by_url(virtual_url, collection_name=_col)
+
+        all_points  = []
+        chunk_idx   = 0
+
+        for chunk in chunks:
+            if chunk.get("skip"):
+                continue
+
+            text      = (chunk.get("text") or "").strip()
+            section   = (chunk.get("section") or "").strip()
+            questions = [q.strip() for q in (chunk.get("questions") or []) if q.strip()]
+            tags      = chunk.get("tags") or []
+
+            if not text or not questions:
+                continue
+
+            # Если есть link — добавляем в текст чтобы GPT мог его процитировать
+            chunk_text = text
+            if link and link not in chunk_text:
+                chunk_text = f"Страница: {link}\n\n{chunk_text}\n\nСсылка для ознакомления: {link}"
+
+            try:
+                vectors = get_embeddings_batch(questions)
+            except Exception as e:
+                logger.error(f"[Catalog] Embedding error for '{entry_id}': {e}")
+                continue
+
+            if len(vectors) != len(questions):
+                logger.warning(f"[Catalog] Vector count mismatch for '{entry_id}' — skipping chunk")
+                continue
+
+            content_hash = hashlib.md5(chunk_text.encode()).hexdigest()
+
+            for question, vector in zip(questions, vectors):
+                all_points.append(PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=vector,
+                    payload={
+                        "text":             chunk_text,
+                        "embed_text":       question,
+                        "page_url":         virtual_url,
+                        "page_title":       title,
+                        "section_title":    section,
+                        "chunk_index":      chunk_idx,
+                        "content_hash":     content_hash,
+                        "is_catalog_chunk": True,
+                        "external_links":   [link] if link else [],
+                        "tags":             tags,
+                    },
+                ))
+
+            chunk_idx += 1
+
+        if all_points:
+            client.upsert(collection_name=_col, points=all_points)
+            logger.info(
+                f"[Catalog] Manual '{title}': {len(all_points)} vectors"
+                + (f" → {link}" if link else "")
+            )
+            total_saved += len(all_points)
+        else:
+            logger.warning(f"[Catalog] Manual '{title}' ({entry_id}): no chunks saved — check questions/text")
+
+    logger.info(f"[Catalog] Manual knowledge done: {total_saved} vectors total")
+    return total_saved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ТОЧКА ВХОДА
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_and_save_catalog_chunks(collection_name: Optional[str] = None) -> int:
+def build_and_save_catalog_chunks(
+    collection_name: Optional[str] = None,
+    pages_cache: Optional[dict] = None,
+) -> int:
     """
-    Строит все три каталога: факультеты, кафедры+ОП, специальности.
+    Строит все каталоги: факультеты, кафедры+ОП, специальности, ручная база знаний.
 
     Args:
         collection_name: Target collection. Defaults to settings value.
+        pages_cache: Dict {url: PageContent} из pipeline — переиспользуем уже скачанные
+                     страницы вместо повторного скачивания.
     """
     total = 0
-    total += build_faculties_catalog(collection_name=collection_name)
-    total += build_departments_catalog(collection_name=collection_name)
-    total += build_specialties_catalog(collection_name=collection_name)
+    total += build_faculties_catalog(collection_name=collection_name, pages_cache=pages_cache)
+    total += build_departments_catalog(collection_name=collection_name, pages_cache=pages_cache)
+    total += build_specialties_catalog(collection_name=collection_name, pages_cache=pages_cache)
+    total += build_manual_knowledge_catalog(collection_name=collection_name)
     logger.info(f"[Catalog] All done. Total catalog vectors: {total}")
     return total

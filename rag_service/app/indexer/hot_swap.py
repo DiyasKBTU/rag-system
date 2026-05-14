@@ -41,6 +41,7 @@ from qdrant_client.models import (
     CreateAliasOperation,
     DeleteAlias,
     DeleteAliasOperation,
+    PointStruct,
 )
 
 from app.config import settings
@@ -189,6 +190,66 @@ def _atomic_swap(shadow_collection: str) -> None:
         raise
 
 
+def _snapshot_active_to_shadow(client, shadow_collection: str) -> int:
+    """
+    Копирует все точки из активной коллекции в теневую через scroll+upsert.
+
+    Зачем:
+      pipeline.page_needs_update() проверяет content_hash в коллекции назначения.
+      Если коллекция пустая — все страницы считаются «новыми» и переиндексируются.
+      Если предварительно скопировать туда все точки из активной коллекции —
+      pipeline пропустит страницы чьи content_hash не изменились.
+
+    Возвращает количество скопированных точек (0 если активная недоступна).
+    """
+    active = get_active_collection()
+    if not active or active == shadow_collection:
+        logger.info("[HotSwap] Snapshot skipped: no active collection or same as shadow")
+        return 0
+
+    existing = [c.name for c in client.get_collections().collections]
+    if active not in existing:
+        logger.info(f"[HotSwap] Snapshot skipped: active collection '{active}' not found")
+        return 0
+
+    logger.info(f"[HotSwap] Snapshot: copying '{active}' → '{shadow_collection}'...")
+    copied = 0
+    offset = None
+
+    try:
+        while True:
+            points, offset = client.scroll(
+                collection_name=active,
+                limit=256,
+                with_vectors=True,
+                with_payload=True,
+                offset=offset,
+            )
+            if not points:
+                break
+
+            client.upsert(
+                collection_name=shadow_collection,
+                points=[
+                    PointStruct(id=p.id, vector=p.vector, payload=p.payload)
+                    for p in points
+                ],
+            )
+            copied += len(points)
+
+            if offset is None:
+                break
+
+        logger.info(f"[HotSwap] Snapshot complete: {copied} points copied → '{shadow_collection}'")
+
+    except Exception as e:
+        # Не критично: pipeline переиндексирует всё с нуля, это только оптимизация
+        logger.warning(f"[HotSwap] Snapshot failed ({e}), will do full reindex")
+        copied = 0
+
+    return copied
+
+
 def run_shadow_indexing() -> dict:
     """
     Полная горячая переиндексация:
@@ -226,6 +287,13 @@ def run_shadow_indexing() -> dict:
 
         ensure_collection_exists(collection_name=shadow)
 
+        # ── Snapshot: копируем активную коллекцию в теневую ──────
+        # Благодаря этому page_needs_update() в pipeline.py найдёт
+        # уже существующие content_hash-и → пропустит неизменённые страницы.
+        # Без этого каждый /reindex переиндексировал всё с нуля ($0.20-0.30, 30-60 мин).
+        # После этого: ~0$ и ~30с если сайт не менялся; только изменённые страницы — GPT.
+        snapshot_points = _snapshot_active_to_shadow(client, shadow)
+
         # ── Индексируем в теневую коллекцию ──────────────────────
         result = run_indexing(collection_name=shadow)
 
@@ -241,8 +309,9 @@ def run_shadow_indexing() -> dict:
         else:
             _first_migration(shadow)
 
-        result["swapped_to"] = shadow
-        result["swap_type"]  = "atomic" if is_alias else "first_migration"
+        result["swapped_to"]      = shadow
+        result["swap_type"]       = "atomic" if is_alias else "first_migration"
+        result["snapshot_points"] = snapshot_points
         _last_result = result
 
         logger.info(f"[HotSwap] Complete. New active collection: '{shadow}'")

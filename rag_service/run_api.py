@@ -27,4 +27,10 @@ if __name__ == "__main__":
         port=8001,
         reload=False,       # Set to True for development (auto-restart on file changes)
         log_level="info",
+        # workers=2 даёт два независимых процесса Python с отдельными threadpool'ами.
+        # Это удваивает пропускную способность для I/O-bound задач (OpenAI, Qdrant, Redis).
+        # ВАЖНО: при workers>1 семафор _search_semaphore работает PER-PROCESS (не глобально).
+        # Итого: 2 workers × 20 slots = 40 параллельных поисков — с запасом для пиковой нагрузки.
+        # Для разработки оставьте workers=1 (или уберите параметр).
+        workers=2,
     )

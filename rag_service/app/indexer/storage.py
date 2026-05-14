@@ -18,8 +18,10 @@ Flow:
 """
 
 import logging
+import threading
 import uuid
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -45,6 +47,7 @@ _STATE_FILE = Path(__file__).resolve().parent.parent.parent / "hot_swap_state.js
 
 # Initialize Qdrant client (connects to local Docker container)
 _client: Optional[QdrantClient] = None
+_client_lock = threading.Lock()
 
 
 # ── State management (hot-swap) ───────────────────────────────────────────────
@@ -71,27 +74,104 @@ def _set_active_collection(name: str) -> None:
     """
     Атомарно обновляет имя активной коллекции в файле состояния.
     Использует write-to-tmp + rename для атомарности.
+    Сохраняет другие поля (last_indexed_at и т.д.) нетронутыми.
     """
+    try:
+        state: dict = {}
+        if _STATE_FILE.exists():
+            state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    state["active_collection"] = name
     tmp = _STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps({"active_collection": name}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     tmp.replace(_STATE_FILE)
+
+
+def get_last_indexed_at() -> Optional[datetime]:
+    """
+    Возвращает время последней успешной полной индексации.
+    Используется pipeline.py для lastmod-фильтрации: страницы не изменившиеся
+    с последней индексации можно не скачивать вообще.
+
+    Возвращает datetime без tzinfo (UTC) или None если ещё не индексировалось.
+    """
+    try:
+        if _STATE_FILE.exists():
+            state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+            ts = state.get("last_indexed_at", "")
+            if ts:
+                dt = datetime.fromisoformat(ts)
+                # Убираем timezone для сравнения с lastmod (у lastmod нет tz)
+                return dt.replace(tzinfo=None)
+    except Exception:
+        pass
+    return None
+
+
+def set_last_indexed_at(dt: Optional[datetime] = None) -> None:
+    """
+    Записывает время последней успешной полной индексации.
+    Вызывается pipeline.py в конце run_indexing().
+
+    Атомарная запись — не затирает другие поля файла состояния.
+    """
+    dt = dt or datetime.now(timezone.utc)
+    try:
+        state: dict = {}
+        if _STATE_FILE.exists():
+            state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        state["last_indexed_at"] = dt.isoformat()
+        tmp = _STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_STATE_FILE)
+        logger.info(f"[Storage] last_indexed_at saved: {dt.isoformat()}")
+    except Exception as e:
+        logger.warning(f"[Storage] Could not save last_indexed_at: {e}")
 
 
 def get_client() -> QdrantClient:
     """
-    Get Qdrant client (create once, reuse).
-    Connects to Qdrant running in Docker on localhost:6333.
+    Get Qdrant client (create once, reuse, auto-reconnect).
+
+    Почему нужен reconnect:
+      Клиент создаётся один раз как синглтон. Если Docker с Qdrant
+      рестартовал или временно упал — HTTP-соединение в пуле протухает.
+      Следующий вызов .search() бросает исключение, которое в search.py
+      молча поглощается → пустые результаты → GPT «не знает».
+
+    Решение: перед возвратом делаем лёгкий ping (get_collections).
+      Если ping упал — сбрасываем синглтон и создаём новый клиент.
+      Lock гарантирует что два потока не пересоздадут клиент одновременно.
     """
     global _client
-    if _client is None:
-        _client = QdrantClient(
-            host=settings.QDRANT_HOST,
-            port=settings.QDRANT_PORT,
-        )
-    return _client
+    with _client_lock:
+        if _client is None:
+            _client = QdrantClient(
+                host=settings.QDRANT_HOST,
+                port=settings.QDRANT_PORT,
+                timeout=10,
+            )
+            logger.info("[Qdrant] Client created")
+            return _client
+
+        # Лёгкий health check — просто проверяем что соединение живо
+        try:
+            _client.get_collections()
+            return _client
+        except Exception as e:
+            logger.warning(f"[Qdrant] Ping failed ({e}), reconnecting...")
+            try:
+                _client.close()
+            except Exception:
+                pass
+            _client = QdrantClient(
+                host=settings.QDRANT_HOST,
+                port=settings.QDRANT_PORT,
+                timeout=10,
+            )
+            logger.info("[Qdrant] Client reconnected")
+            return _client
 
 
 def ensure_collection_exists(collection_name: Optional[str] = None) -> None:
@@ -134,6 +214,18 @@ def ensure_collection_exists(collection_name: Optional[str] = None) -> None:
                 distance=Distance.COSINE,
             ),
         )
+        # Payload index на page_url: ускоряет delete_chunks_by_url() и page_needs_update().
+        # Без индекса Qdrant сканирует все ~2000 точек при каждом фильтре по URL.
+        # С индексом — O(log n). Особенно важно при параллельной записи в pipeline.
+        try:
+            client.create_payload_index(
+                collection_name=_col,
+                field_name="page_url",
+                field_schema="keyword",
+            )
+            logger.info("[Qdrant] Payload index created on 'page_url'")
+        except Exception as e:
+            logger.warning(f"[Qdrant] Could not create payload index (non-critical): {e}")
         logger.info("[Qdrant] Collection created successfully")
     else:
         logger.debug(f"[Qdrant] Collection already exists: {_col}")
@@ -209,13 +301,14 @@ def save_chunks(chunks: List[TextChunk], page_url: str, content_hash: str,
             id=str(uuid.uuid4()),
             vector=vector,
             payload={
-                "text":          chunk.text,
-                "embed_text":    chunk.embed_text or "",
-                "page_url":      chunk.page_url,
-                "page_title":    chunk.page_title,
-                "section_title": chunk.section_title,
-                "chunk_index":   chunk.index,
-                "content_hash":  content_hash,
+                "text":           chunk.text,
+                "embed_text":     chunk.embed_text or "",
+                "page_url":       chunk.page_url,
+                "page_title":     chunk.page_title,
+                "section_title":  chunk.section_title,
+                "chunk_index":    chunk.index,
+                "content_hash":   content_hash,
+                "external_links": getattr(chunk, "external_links", []) or [],
             },
         ))
 
@@ -274,6 +367,47 @@ def get_collection_stats(collection_name: Optional[str] = None) -> dict:
             "collection":   _col,
             "status":       "not_found",
         }
+
+
+def url_is_manually_edited(page_url: str,
+                           collection_name: Optional[str] = None) -> bool:
+    """
+    Проверяет, все ли чанки для данного URL созданы вручную через chunk_editor.
+
+    Возвращает True если:
+      - Для URL есть чанки в Qdrant
+      - ВСЕ из них имеют флаг manually_edited=True
+
+    Возвращает False если:
+      - Нет чанков вообще (новая страница → нужна индексация)
+      - Хотя бы один чанк без флага (авто-индексированная страница)
+
+    Используется в pipeline.py чтобы не затирать ручные правки при переиндексации.
+    """
+    _col = collection_name or get_active_collection()
+    client = get_client()
+
+    results = client.scroll(
+        collection_name=_col,
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(
+                    key="page_url",
+                    match=MatchValue(value=page_url),
+                )
+            ]
+        ),
+        limit=200,  # Достаточно для любой страницы (обычно <20 чанков)
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    points, _ = results
+
+    if not points:
+        return False  # Нет чанков — новая страница, индексируем
+
+    return all(p.payload.get("manually_edited") is True for p in points)
 
 
 def page_needs_update(page_url: str, new_hash: str,

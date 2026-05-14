@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 INPUT_FILE = Path(__file__).resolve().parent.parent / "chunks_export.json"
 
 
+
 # ── Сохранение с поддержкой тегов ─────────────────────────────────────────────
 
 def _save_chunks_with_tags(
@@ -174,9 +175,10 @@ def index_from_chunks(
     questions_per_chunk: int = 4,
     clear_first: bool = False,
     dry_run: bool = False,
+    input_file: Optional[Path] = None,
 ) -> None:
     """
-    Читает chunks_export.json и индексирует в Qdrant.
+    Читает JSON файл с чанками и индексирует в Qdrant.
 
     Логика вопросов для каждого чанка:
       1. Если в чанке есть поле "questions": ["...", "..."] — используем их,
@@ -189,13 +191,18 @@ def index_from_chunks(
         questions_per_chunk: сколько вопросов GPT генерирует на чанк (по умолчанию 4)
         clear_first:         очистить коллекцию перед индексацией
         dry_run:             не писать в Qdrant, только показать что было бы
+        input_file:          путь к JSON файлу (по умолчанию chunks_export.json)
     """
-    if not INPUT_FILE.exists():
-        logger.error(f"Файл не найден: {INPUT_FILE}")
+    target_file = input_file or INPUT_FILE
+
+    if not target_file.exists():
+        logger.error(f"Файл не найден: {target_file}")
         logger.error("Сначала запустите: python tools/export_chunks.py")
         sys.exit(1)
 
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+    logger.info(f"Файл:               {target_file.name}")
+
+    with open(target_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     pages = data.get("pages", [])
@@ -347,11 +354,12 @@ def index_from_chunks(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Индексация из отредактированного chunks_export.json",
+        description="Индексация из отредактированного JSON файла с чанками",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
   python tools/index_from_chunks.py
+  python tools/index_from_chunks.py --file supplement_facts.json
   python tools/index_from_chunks.py --questions-per-chunk 6
   python tools/index_from_chunks.py --no-questions
   python tools/index_from_chunks.py --clear --dry-run
@@ -361,6 +369,11 @@ if __name__ == "__main__":
   Чанки с пустым "questions" → GPT генерирует --questions-per-chunk вопросов.
   --no-questions → вопросы не генерируются ВООБЩЕ (ручные из JSON всё равно используются).
         """,
+    )
+    parser.add_argument(
+        "--file", type=str, default=None, metavar="PATH",
+        help="Путь к JSON файлу с чанками (по умолчанию chunks_export.json в корне проекта). "
+             "Можно передать относительный путь от корня проекта или абсолютный.",
     )
     parser.add_argument(
         "--no-questions", action="store_true",
@@ -382,9 +395,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    # Определяем путь к файлу
+    if args.file:
+        custom_path = Path(args.file)
+        if not custom_path.is_absolute():
+            custom_path = Path(__file__).resolve().parent.parent / args.file
+        chosen_file = custom_path
+    else:
+        chosen_file = INPUT_FILE
+
     index_from_chunks(
         generate_questions=not args.no_questions,
         questions_per_chunk=args.questions_per_chunk,
         clear_first=args.clear,
         dry_run=args.dry_run,
+        input_file=chosen_file,
     )
