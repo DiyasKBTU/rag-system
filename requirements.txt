@@ -66,7 +66,7 @@ pyparsing==3.3.2
 python-decouple==3.8
 python-dotenv==1.0.1
 python-multipart==0.0.26
-pywin32==311
+# pywin32==311  # Windows only, не нужен на Linux
 PyYAML==6.0.3
 qdrant-client==1.9.1
 rapidfuzz==3.9.3
