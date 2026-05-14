@@ -35,3 +35,13 @@ logs/
 htmlcov/
 .coverage
 *.csv
+
+# Межпроцессные файловые локи (рантайм-артефакты)
+*.lock
+indexing.lock
+scheduler.lock
+
+# Состояние hot-swap и расписания (рантайм)
+hot_swap_state.json
+schedule_state.json
+fetch_cache.pkl

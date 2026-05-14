@@ -8,12 +8,16 @@ redis_client.py — Утилита подключения к Redis.
   Ошибка логируется один раз, повторные попытки не делаются до рестарта.
 
 Использование:
-  from app.redis_client import get_redis, REDIS_AVAILABLE
+  from app.redis_client import get_redis, is_redis_available
 
   r = get_redis()
   if r:
       r.set("key", "value", ex=86400)
       val = r.get("key")
+
+  # Если нужен только статус без объекта клиента:
+  if is_redis_available():
+      ...
 
 Почему sync redis, а не aioredis:
   RAG-сервис использует sync FastAPI endpoints (не async def).
@@ -80,7 +84,17 @@ def get_redis():
         return None
 
 
-@property
-def REDIS_AVAILABLE() -> bool:
-    """True если Redis успешно подключён."""
+def is_redis_available() -> bool:
+    """
+    True если Redis успешно подключён, False — если недоступен или ещё не проверяли.
+
+    Семантика:
+      - До первого вызова get_redis()      → False (статус неизвестен)
+      - После успешного подключения        → True
+      - После неудачной попытки подключения → False (повторных попыток не делается)
+
+    Зачем функция, а не переменная:
+      _redis_available обновляется внутри get_redis() — переменная на момент
+      импорта всегда False. Функция читает АКТУАЛЬНОЕ значение в момент вызова.
+    """
     return _redis_available is True

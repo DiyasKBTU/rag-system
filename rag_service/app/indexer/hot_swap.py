@@ -34,7 +34,10 @@ hot_swap.py — Blue/Green деплой для Qdrant без перезапус�
 import threading
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+
+import portalocker
 
 from qdrant_client.models import (
     CreateAlias,
@@ -60,11 +63,57 @@ logger = logging.getLogger(__name__)
 COLLECTION_BLUE  = f"{settings.QDRANT_COLLECTION_NAME}_blue"
 COLLECTION_GREEN = f"{settings.QDRANT_COLLECTION_NAME}_green"
 
-# ── Глобальный замок и флаг состояния ────────────────────────────────────────
+# ── Двухуровневая блокировка индексации ──────────────────────────────────────
+# Уровень 1 (threading.Lock) — защищает от двух потоков ВНУТРИ одного процесса.
+# Уровень 2 (portalocker, файловый lock) — защищает от двух ПРОЦЕССОВ uvicorn
+#     (workers=2 в run_api.py запускает два независимых интерпретатора, в каждом
+#      из них crontab-loop и /index endpoint).
+# Файловый lock работает поверх ОС-вызовов (Windows: LockFileEx; Unix: flock),
+# виден всем процессам на этой машине → гарантирует ровно одну индексацию.
 _indexing_lock    = threading.Lock()
-_indexing_active  = False       # True пока идёт индексация
+_INDEXING_LOCK_FILE = Path(__file__).resolve().parent.parent.parent / "indexing.lock"
+_indexing_active  = False       # True пока идёт индексация (для текущего процесса)
 _last_result: Optional[dict] = None      # Результат последней индексации
 _started_at: Optional[str]   = None      # ISO timestamp старта
+
+
+def _try_acquire_file_lock():
+    """
+    Пытается захватить межпроцессный файловый lock.
+    Возвращает file handle если успешно, None если уже захвачен другим процессом.
+    Handle нужно держать открытым на всё время индексации;
+    при close() или process exit — lock освобождается автоматически.
+    """
+    try:
+        _INDEXING_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Открываем в режиме "r+" если файл есть, иначе создаём.
+        # portalocker.LOCK_EX | LOCK_NB — эксклюзивный non-blocking lock.
+        fh = open(_INDEXING_LOCK_FILE, "a+")
+        try:
+            portalocker.lock(fh, portalocker.LOCK_EX | portalocker.LOCK_NB)
+            return fh
+        except portalocker.exceptions.LockException:
+            fh.close()
+            return None
+    except Exception as e:
+        # Если файловый lock сломался по какой-то причине (права, FS) —
+        # лучше всё равно НЕ запускать индексацию, чем стартовать без защиты.
+        logger.error(f"[HotSwap] File lock error: {e}")
+        return None
+
+
+def _release_file_lock(fh) -> None:
+    """Освобождает файловый lock. Безопасно вызывать с None."""
+    if fh is None:
+        return
+    try:
+        portalocker.unlock(fh)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
 
 
 def get_shadow_collection_name() -> str:
@@ -264,8 +313,20 @@ def run_shadow_indexing() -> dict:
     """
     global _indexing_active, _last_result, _started_at
 
+    # ── Уровень 1: межпроцессный файловый lock ──────────────────
+    # Защищает от второго uvicorn-воркера (workers=2 в run_api.py).
+    # Если файл уже залочен другим процессом — выходим без действия.
+    file_lock_handle = _try_acquire_file_lock()
+    if file_lock_handle is None:
+        logger.warning(
+            "[HotSwap] Indexing already running in another process — skipping duplicate request"
+        )
+        return {"status": "skipped", "reason": "already_in_progress_other_process"}
+
+    # ── Уровень 2: внутрипроцессный лок (на случай двух потоков) ─
     if not _indexing_lock.acquire(blocking=False):
-        logger.warning("[HotSwap] Indexing already in progress, skipping duplicate request")
+        _release_file_lock(file_lock_handle)
+        logger.warning("[HotSwap] Indexing already in progress (same process), skipping duplicate request")
         return {"status": "skipped", "reason": "already_in_progress"}
 
     _indexing_active = True
@@ -330,6 +391,7 @@ def run_shadow_indexing() -> dict:
     finally:
         _indexing_active = False
         _indexing_lock.release()
+        _release_file_lock(file_lock_handle)
 
 
 def get_indexing_status() -> dict:

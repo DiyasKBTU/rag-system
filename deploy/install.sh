@@ -35,8 +35,8 @@ echo ""
 # Подставляем реальные значения в шаблоны и копируем в systemd
 for SERVICE in caiu-rag caiu-bot; do
     sed \
-        -e "s|YOUR_USER|${USER_NAME}|g" \
         -e "s|/home/YOUR_USER/caiu-bot|${PROJECT_DIR}|g" \
+        -e "s|YOUR_USER|${USER_NAME}|g" \
         "${SERVICE}.service" > "/etc/systemd/system/${SERVICE}.service"
     echo "  ✓ /etc/systemd/system/${SERVICE}.service"
 done

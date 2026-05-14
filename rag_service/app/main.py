@@ -29,6 +29,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import portalocker
+
 # ── Ограничитель конкурентных поисков ────────────────────────────────────────
 # Каждый поиск делает вызов к OpenAI Embeddings API.
 # При 50+ одновременных запросах OpenAI может вернуть 429 (rate limit).
@@ -39,8 +41,15 @@ from pathlib import Path
 #   - OpenAI RPM лимит для text-embedding-3-small: обычно 3000 RPM = 50/сек
 #   - Средняя задержка поиска: ~1-2 сек → 20 * (1/1.5) ≈ 13 запросов/сек
 #   - Это с большим запасом для пикового потока абитуриентов
+#
+# ВАЖНО: asyncio.Semaphore (а не threading.Semaphore) — endpoint async,
+# ожидание слота происходит в event loop и НЕ занимает поток threadpool.
+# Это означает что при 100 одновременных запросах:
+#   - 20 реально работают (зашли в семафор → search() в to_thread)
+#   - 80 висят в семафоре как лёгкие корутины (не съедают потоки)
+#   - /health и другие endpoints отзывчивы (event loop свободен).
 MAX_CONCURRENT_SEARCHES = 20
-_search_semaphore = threading.Semaphore(MAX_CONCURRENT_SEARCHES)
+_search_semaphore: "asyncio.Semaphore | None" = None  # создаётся лениво в lifespan
 
 from app.logging_setup import setup_logging
 setup_logging("api")
@@ -121,6 +130,51 @@ def _parse_schedule_datetime(dt_str: str) -> Optional[datetime]:
     return None
 
 
+# Отдельный файловый lock для решения "пора ли стартовать".
+# НЕ совпадает с indexing.lock — иначе scheduler бы конфликтовал с уже идущей
+# индексацией. Этот lock защищает только короткую критическую секцию:
+# read schedule → check time → mark fired → write schedule. Сама индексация
+# запускается уже ПОСЛЕ освобождения этого lock — она возьмёт свой собственный
+# межпроцессный lock в hot_swap.run_shadow_indexing.
+_SCHEDULER_DECISION_LOCK_FILE = (
+    Path(__file__).resolve().parent.parent / "scheduler.lock"
+)
+
+
+def _try_acquire_scheduler_lock():
+    """
+    Пытается захватить файловый lock для compare-and-swap расписания.
+    Возвращает file handle если успешно, None если уже захвачен.
+    Lock держится КОРОТКО — только пока читаем/пишем schedule_state.json.
+    """
+    try:
+        _SCHEDULER_DECISION_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(_SCHEDULER_DECISION_LOCK_FILE, "a+")
+        try:
+            portalocker.lock(fh, portalocker.LOCK_EX | portalocker.LOCK_NB)
+            return fh
+        except portalocker.exceptions.LockException:
+            fh.close()
+            return None
+    except Exception as e:
+        logger.error(f"[Scheduler] Decision lock error: {e}")
+        return None
+
+
+def _release_scheduler_lock(fh) -> None:
+    """Освобождает scheduler decision lock."""
+    if fh is None:
+        return
+    try:
+        portalocker.unlock(fh)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
 async def _scheduler_loop() -> None:
     """
     Фоновая корутина: проверяет расписание каждые 30 секунд.
@@ -130,27 +184,98 @@ async def _scheduler_loop() -> None:
     Поддерживает recurring (ежедневное повторение):
       Если в расписании есть поле "recurring": true — после срабатывания
       автоматически создаётся новое расписание на завтра в то же время.
+
+    Безопасно для workers=2 в uvicorn:
+      Compare-and-swap (read fired → mark fired=True) выполняется под файловым
+      межпроцессным lock'ом (scheduler.lock). Только один из двух воркеров
+      пройдёт критическую секцию; второй увидит fired=True и пропустит запуск.
     """
     logger.info("[Scheduler] Background scheduler started (checks every 30s)")
     while True:
         try:
-            schedule = _read_schedule()
-            if schedule and not schedule.get("fired"):
-                scheduled_dt_str = schedule.get("scheduled_datetime", "")
-                if scheduled_dt_str:
-                    scheduled_dt = datetime.fromisoformat(scheduled_dt_str)
-                    now = datetime.now()
-                    # Запускаем если время пришло.
-                    # Допуск 5 минут — на случай если сервис рестартовал чуть после расписания.
-                    # fired=True предотвращает повторный запуск при следующей проверке.
-                    if now >= scheduled_dt and (now - scheduled_dt).total_seconds() <= 300:
-                        logger.info(f"[Scheduler] Firing scheduled indexing at {scheduled_dt_str}")
+            # Дешёвая предпроверка БЕЗ lock'a — большую часть времени
+            # расписания нет или время не пришло. Lock берём только когда
+            # реально надо что-то менять.
+            pre = _read_schedule()
+            should_try_fire = False
+            if pre and not pre.get("fired"):
+                pre_dt_str = pre.get("scheduled_datetime", "")
+                if pre_dt_str:
+                    try:
+                        pre_dt = datetime.fromisoformat(pre_dt_str)
+                        now_pre = datetime.now()
+                        if now_pre >= pre_dt and (now_pre - pre_dt).total_seconds() <= 300:
+                            should_try_fire = True
+                    except Exception:
+                        pass
 
-                        is_recurring = schedule.get("recurring", False)
-                        schedule["fired"] = True
-                        schedule["fired_at"] = datetime.now(timezone.utc).isoformat()
-                        _write_schedule(schedule)
+            if should_try_fire:
+                # ── Критическая секция: read-modify-write под межпроцессным lock'ом ─
+                lock_fh = _try_acquire_scheduler_lock()
+                if lock_fh is None:
+                    # Другой воркер уже принимает решение — мы выходим.
+                    # На следующей итерации (через 30с) мы увидим fired=True
+                    # либо обновлённое recurring-расписание.
+                    logger.debug("[Scheduler] Decision lock held by another worker, skipping")
+                else:
+                    try:
+                        # Перечитываем под lock'ом — состояние могло измениться.
+                        schedule = _read_schedule()
+                        if schedule and not schedule.get("fired"):
+                            scheduled_dt_str = schedule.get("scheduled_datetime", "")
+                            if scheduled_dt_str:
+                                scheduled_dt = datetime.fromisoformat(scheduled_dt_str)
+                                now = datetime.now()
+                                if now >= scheduled_dt and (now - scheduled_dt).total_seconds() <= 300:
+                                    logger.info(
+                                        f"[Scheduler] Firing scheduled indexing at {scheduled_dt_str}"
+                                    )
 
+                                    is_recurring = schedule.get("recurring", False)
+                                    schedule["fired"] = True
+                                    schedule["fired_at"] = datetime.now(timezone.utc).isoformat()
+                                    _write_schedule(schedule)
+
+                                    # Если recurring — сразу записываем следующий запуск,
+                                    # пока держим lock (атомарно с пометкой fired).
+                                    if is_recurring:
+                                        next_dt = scheduled_dt + timedelta(days=1)
+                                        if next_dt <= now:
+                                            next_dt = now.replace(
+                                                hour=scheduled_dt.hour,
+                                                minute=scheduled_dt.minute,
+                                                second=0,
+                                                microsecond=0,
+                                            ) + timedelta(days=1)
+
+                                        next_schedule = {
+                                            "scheduled_datetime": next_dt.isoformat(),
+                                            "created_at": datetime.now(timezone.utc).isoformat(),
+                                            "fired": False,
+                                            "recurring": True,
+                                        }
+                                        _write_schedule(next_schedule)
+                                        logger.info(
+                                            f"[Scheduler] Recurring: next run scheduled for "
+                                            f"{next_dt.strftime('%d.%m.%Y %H:%M')}"
+                                        )
+
+                                    # Запускаем индексацию ПОСЛЕ освобождения lock'а
+                                    # (см. ниже). Сама индексация возьмёт свой собственный
+                                    # межпроцессный lock в hot_swap.
+                                    fire_indexing = True
+                                else:
+                                    fire_indexing = False
+                            else:
+                                fire_indexing = False
+                        else:
+                            # Кто-то уже пометил fired=True (другой воркер успел раньше)
+                            fire_indexing = False
+                    finally:
+                        _release_scheduler_lock(lock_fh)
+
+                    # Стартуем индексацию ВНЕ lock'а
+                    if 'fire_indexing' in locals() and fire_indexing:
                         from app.indexer.hot_swap import run_shadow_indexing
                         t = threading.Thread(
                             target=run_shadow_indexing,
@@ -158,30 +283,6 @@ async def _scheduler_loop() -> None:
                             name="hot_swap_indexing",
                         )
                         t.start()
-
-                        # Если recurring — автоматически планируем следующий запуск
-                        if is_recurring:
-                            next_dt = scheduled_dt + timedelta(days=1)
-                            # Если следующее время уже прошло (сервис стоял >24ч) — переносим на сегодня+1
-                            if next_dt <= now:
-                                next_dt = now.replace(
-                                    hour=scheduled_dt.hour,
-                                    minute=scheduled_dt.minute,
-                                    second=0,
-                                    microsecond=0,
-                                ) + timedelta(days=1)
-
-                            next_schedule = {
-                                "scheduled_datetime": next_dt.isoformat(),
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "fired": False,
-                                "recurring": True,
-                            }
-                            _write_schedule(next_schedule)
-                            logger.info(
-                                f"[Scheduler] Recurring: next run scheduled for "
-                                f"{next_dt.strftime('%d.%m.%Y %H:%M')}"
-                            )
 
         except Exception as e:
             logger.error(f"[Scheduler] Error in scheduler loop: {e}")
@@ -196,7 +297,15 @@ async def lifespan(app: FastAPI):
     Called once when server starts.
     Connects to Qdrant, ensures collection exists, starts background scheduler.
     """
+    global _search_semaphore
+
     logger.info("Starting RAG service...")
+
+    # asyncio.Semaphore нужно создавать когда event loop уже работает.
+    # Module-level создание может привязать его к другому loop'у при workers>1.
+    _search_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
+    logger.info(f"Search semaphore initialised: {MAX_CONCURRENT_SEARCHES} slots")
+
     try:
         ensure_collection_exists()
         stats = get_collection_stats()
@@ -379,7 +488,7 @@ def get_stats(api_key: str = Depends(verify_api_key)):
 
 
 @app.post("/search", response_model=SearchResponse)
-def search_endpoint(
+async def search_endpoint(
     request: SearchRequest,
     api_key: str = Depends(verify_api_key),
 ):
@@ -388,6 +497,15 @@ def search_endpoint(
 
     Бот вызывает его для каждого вопроса пользователя.
     Возвращает релевантные фрагменты текста для передачи в ChatGPT.
+
+    Архитектура (async):
+      1. Ожидание слота в семафоре — happens в event loop, поток НЕ занят.
+         При 100 одновременных запросах 80 ждут как лёгкие корутины (~1 KB),
+         а не как заблокированные потоки threadpool.
+      2. Сам поиск (sync OpenAI + sync Qdrant) запускается через asyncio.to_thread —
+         блокирующая работа уезжает в threadpool, event loop остаётся свободным
+         для других endpoints (/health, /index/status и т.д.).
+      3. После поиска release семафора → следующая корутина выходит из ожидания.
 
     Пример запроса:
         POST /search
@@ -398,15 +516,24 @@ def search_endpoint(
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     question = request.question.strip()
-    logger.info(f"Search request: '{question[:80]}...' " if len(question) > 80 else f"Search request: '{question}'")
+    logger.info(
+        f"Search request: '{question[:80]}...'" if len(question) > 80
+        else f"Search request: '{question}'"
+    )
+
+    if _search_semaphore is None:
+        # Не должно произойти — lifespan инициализирует семафор до приёма запросов.
+        logger.error("Search semaphore not initialised — lifespan never ran?")
+        raise HTTPException(status_code=500, detail="Service not initialised")
 
     start_time = time.time()
 
-    # Ждём слота в семафоре (не более MAX_CONCURRENT_SEARCHES одновременно).
-    # Если свободных слотов нет — запрос блокируется здесь, но не падает.
-    # pool=5.0 в httpx клиенте бота тоже даёт backpressure со стороны клиента.
-    acquired = _search_semaphore.acquire(timeout=20.0)
-    if not acquired:
+    # Ждём слота в семафоре — без блокировки потока threadpool.
+    # При перегрузке (все 20 слотов заняты дольше 20 сек) — отказ 503,
+    # чтобы клиент мог отступить и попробовать снова.
+    try:
+        await asyncio.wait_for(_search_semaphore.acquire(), timeout=20.0)
+    except asyncio.TimeoutError:
         logger.warning("Search semaphore timeout — too many concurrent requests")
         raise HTTPException(
             status_code=503,
@@ -414,20 +541,25 @@ def search_endpoint(
         )
 
     try:
-        # Один вызов search() → форматируем готовые результаты.
-        # format_results_as_context не вызывает search() повторно — нет двойных расходов.
-        results = search(
-            question=question,
-            top_k=request.top_k,
-            min_score=request.min_score,
+        # search() — блокирующая (sync OpenAI, sync Qdrant), запускаем в threadpool.
+        # to_thread возвращает корутину — мы её awaiт'им, освобождая event loop
+        # для других одновременных запросов (включая ожидающих в семафоре).
+        results = await asyncio.to_thread(
+            search,
+            question,
+            request.top_k,
+            request.min_score,
         )
+
+        # format_results_as_context — быстрая строковая работа, оставляем в event loop.
         context = format_results_as_context(question, results) if results else ""
 
         # Когда уверенного ответа нет — получаем страницы-кандидаты для показа в боте.
         # Эмбеддинг уже в кеше после search() → дополнительного вызова OpenAI нет.
+        # Тоже sync — через to_thread.
         candidates = []
         if not results:
-            raw_candidates = get_candidate_urls(question, top_k=3)
+            raw_candidates = await asyncio.to_thread(get_candidate_urls, question, 3)
             candidates = [
                 CandidateUrl(
                     url=c["url"],
