@@ -80,7 +80,8 @@ class Stats:
     """Сбор и отображение статистики с учётом in-flight запросов."""
 
     def __init__(self):
-        self.response_times: list = []       # (timestamp, seconds)
+        self.response_times: list = []       # (timestamp, seconds) — только успешные
+        self.all_response_times: list = []   # (timestamp, seconds) — все запросы
         self.errors: list = []
         self.status_codes: dict = defaultdict(int)
         self.start_time: float = time.monotonic()
@@ -105,6 +106,7 @@ class Stats:
             self.status_codes[status_code] += 1
             ts = time.monotonic() - self.start_time
             self.inflight_history.append((ts, self._inflight))
+            self.all_response_times.append((ts, response_time))   # все
             if error or status_code >= 400:
                 self.errors.append({
                     "ts":     ts,
@@ -113,7 +115,7 @@ class Stats:
                     "error":  error or f"HTTP {status_code}",
                 })
             else:
-                self.response_times.append((ts, response_time))
+                self.response_times.append((ts, response_time))   # только успешные
 
     def inflight_now(self) -> int:
         return self._inflight
@@ -144,26 +146,39 @@ class Stats:
             end="", flush=True,
         )
 
-    def _histogram(self, times: list, width: int = 36) -> str:
+    @staticmethod
+    def _fmt_time(sec: float) -> str:
+        """Умное форматирование: ms если < 1s, иначе секунды."""
+        if sec < 1.0:
+            return f"{sec*1000:.0f}ms"
+        return f"{sec:.2f}s "
+
+    def _histogram(self, times: list, width: int = 36, label: str = "") -> str:
+        """Гистограмма. times — список секунд (float)."""
         if not times:
             return "  (нет данных)"
         mn, mx = min(times), max(times)
-        if mx - mn < 0.1:
-            return f"  все запросы ≈ {mn:.1f}s"
+        rng = mx - mn
+        if rng < 0.001:
+            return f"  все запросы ≈ {self._fmt_time(mn)}"
         buckets = 10
-        step = (mx - mn) / buckets
+        step = rng / buckets
         counts = [0] * buckets
         for t in times:
             idx = min(int((t - mn) / step), buckets - 1)
             counts[idx] += 1
         max_count = max(counts) or 1
         lines = []
+        if label:
+            lines.append(f"  {label}")
         for i, cnt in enumerate(counts):
             lo = mn + i * step
             hi = lo + step
             bar = "█" * int(cnt / max_count * width)
             pct = cnt / len(times) * 100
-            lines.append(f"  {lo:5.1f}–{hi:4.1f}s │{bar:<{width}}│ {cnt:3d} ({pct:.0f}%)")
+            lo_s = self._fmt_time(lo)
+            hi_s = self._fmt_time(hi)
+            lines.append(f"  {lo_s:>6}–{hi_s:<7} │{bar:<{width}}│ {cnt:3d} ({pct:.0f}%)")
         return "\n".join(lines)
 
     def _inflight_chart(self, width: int = 50) -> str:
@@ -230,9 +245,10 @@ class Stats:
             print(f"   Максимум:  {max(all_times):.2f}s")
 
             # Сравнение первой и второй половины теста (деградация под нагрузкой)
+            # Используем ВСЕ запросы (включая ошибки) для честной картины
             half = elapsed / 2
-            first_half  = [t for ts, t in self.response_times if ts < half]
-            second_half = [t for ts, t in self.response_times if ts >= half]
+            first_half  = [t for ts, t in self.all_response_times if ts < half]
+            second_half = [t for ts, t in self.all_response_times if ts >= half]
             if first_half and second_half:
                 avg1 = statistics.mean(first_half)
                 avg2 = statistics.mean(second_half)
@@ -247,10 +263,14 @@ class Stats:
         print(f"\n📉 In-flight запросов во времени (пик: {self.peak_inflight}):")
         print(self._inflight_chart())
 
-        # Гистограмма времён ответа
-        if all_times:
-            print(f"\n📊 Распределение времени ответа:")
-            print(self._histogram(all_times))
+        # Гистограмма — все запросы (включая ошибки)
+        all_req_times = [t for _, t in self.all_response_times]
+        if all_req_times:
+            print(f"\n📊 Распределение времени ответа (все {len(all_req_times)} запросов):")
+            print(self._histogram(all_req_times))
+            if all_times and len(all_times) < len(all_req_times):
+                print(f"\n   Только успешные ({len(all_times)} из {len(all_req_times)}):")
+                print(self._histogram(all_times))
 
         if self.status_codes:
             print(f"\n📋 Коды ответов:")
@@ -274,10 +294,10 @@ class Stats:
         print(f"\n{'=' * 62}")
         error_rate   = err / total if total else 0
         p95          = self.percentile(95)
-        first_half   = [t for ts, t in self.response_times if ts < elapsed / 2]
-        second_half  = [t for ts, t in self.response_times if ts >= elapsed / 2]
-        avg1 = statistics.mean(first_half)  if first_half  else 0
-        avg2 = statistics.mean(second_half) if second_half else 0
+        _fh = [t for ts, t in self.all_response_times if ts < elapsed / 2]
+        _sh = [t for ts, t in self.all_response_times if ts >= elapsed / 2]
+        avg1 = statistics.mean(_fh) if _fh else 0
+        avg2 = statistics.mean(_sh) if _sh else 0
         degradation  = (avg2 - avg1) / avg1 if avg1 else 0
 
         if error_rate < 0.01 and p95 < 12 and degradation < 0.30:
