@@ -28,6 +28,8 @@ pipeline.py — Единая функция полной индексации.
   через page_needs_update(), так что повторный запуск безопасен.
 """
 
+import signal
+import threading
 import time
 import pickle
 import hashlib
@@ -43,17 +45,53 @@ from app.parser.extractor import get_page_content
 from app.parser.chunker import split_into_chunks
 from app.indexer.storage import (
     ensure_collection_exists,
-    save_chunks,
+    save_chunks_precomputed,
     get_collection_stats,
     page_needs_update,
     url_is_manually_edited,
     get_last_indexed_at,
     set_last_indexed_at,
 )
+from app.indexer.embeddings import get_embeddings_batch
 from app.indexer.question_generator import generate_question_chunks
 from app.indexer.catalog_builder import build_and_save_catalog_chunks
 
 logger = logging.getLogger(__name__)
+
+# ── Graceful shutdown при активной индексации ─────────────────────────────────
+# Если systemctl stop / SIGTERM приходит во время pipeline.run_indexing():
+#   - без защиты: indexing.lock остаётся захваченным, fetch_cache.pkl может быть
+#     частично записан, следующий старт не сможет начать индексацию.
+#   - с защитом: _shutdown_requested ставится в True после текущей страницы,
+#     fetch_cache.pkl сохраняется корректно, lock снимается в hot_swap.py.
+#
+# Важно: SIGTERM handler должен быть зарегистрирован только в основном потоке
+# (CPython requirement). hot_swap.run_shadow_indexing() запускается в daemon-thread,
+# поэтому регистрацию делаем в run_indexing() с проверкой is_main_thread().
+_shutdown_requested = threading.Event()
+
+
+def _sigterm_handler(signum, frame):
+    """Устанавливает флаг завершения — pipeline корректно завершит текущую страницу."""
+    logger.warning("[Pipeline] SIGTERM received — will stop after current page")
+    _shutdown_requested.set()
+
+
+def _register_sigterm_handler():
+    """
+    Регистрирует SIGTERM handler если мы в основном потоке.
+    Возвращает старый handler если был установлен, иначе None.
+    Сохраняем старый handler ДО регистрации нового, чтобы не потерять SIG_DFL.
+    """
+    if not isinstance(threading.current_thread(), threading._MainThread):
+        return None
+    try:
+        old = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+        return old
+    except Exception:
+        return None
+
 
 # Файл кеша скачанных страниц — для resume при обрыве интернета.
 # Хранится рядом с hot_swap_state.json (в rag_service/).
@@ -194,6 +232,12 @@ def run_indexing(collection_name: Optional[str] = None) -> dict:
     """
     _col = collection_name or settings.QDRANT_COLLECTION_NAME
 
+    # Регистрируем SIGTERM handler (только в main thread; в daemon thread — no-op).
+    # _register_sigterm_handler возвращает старый handler (или None если не в main thread).
+    _shutdown_requested.clear()
+    _old_sigterm = _register_sigterm_handler()
+    _sigterm_registered = _old_sigterm is not None
+
     logger.info(f"[Pipeline] Starting indexing → collection='{_col}'")
 
     # ── Шаг 1: убеждаемся что коллекция существует ──────────────
@@ -268,29 +312,47 @@ def run_indexing(collection_name: Optional[str] = None) -> dict:
     skipped_pages  = 0
     failed_pages   = 0
 
-    # ── Шаг 4: обрабатываем страницы из кеша ────────────────────
-    # Порядок — как в исходном списке URL (для детерминированного лога).
-    # time.sleep() убран: задержка уже была в фазе скачивания.
+    # ── Шаг 4: трёхфазная обработка (сбор → батч-эмбеддинги → сохранение) ────
+    #
+    # Старый подход: для каждой страницы отдельно → generate_questions → embeddings → save.
+    # При 150 страницах × 20 чанков = 150 вызовов OpenAI Embeddings API.
+    #
+    # Новый подход:
+    #   4a. Фаза сбора — проверяем все страницы, собираем чанки тех что изменились.
+    #   4b. Батч-вопросы — generate_question_chunks для ВСЕХ чанков разом (1 event loop,
+    #       единый AsyncOpenAI клиент и семафор вместо per-page).
+    #   4c. Батч-эмбеддинги — get_embeddings_batch для ВСЕХ чанков разом (30 вызовов
+    #       вместо 150 при BATCH_SIZE=100 и 3000 чанках).
+    #   4d. Сохранение — save_chunks_precomputed с уже готовыми векторами.
+
+    # ── 4a: Фаза сбора ───────────────────────────────────────────
+    # pages_to_index: список (url, content_hash, title, text_chunks)
+    pages_to_index: list = []
+
     for i, url_item in enumerate(urls, 1):
         url = url_item.url
 
-        # Bug #7: страница пропущена по lastmod — уже актуальна в коллекции (snapshot)
+        # Graceful shutdown: если SIGTERM пришёл — сохраняем кеш и выходим корректно.
+        # hot_swap.py снимет indexing.lock в своём finally-блоке.
+        if _shutdown_requested.is_set():
+            logger.warning(
+                f"[Pipeline] Shutdown requested at page {i}/{len(urls)} — "
+                f"saving fetch cache for resume"
+            )
+            _save_fetch_cache(fetched_pages)
+            break
+
         if url in lastmod_skipped_urls:
             logger.debug(f"[Pipeline] [{i}/{len(urls)}] Skipped (lastmod): {url}")
             skipped_pages += 1
             continue
 
         content = fetched_pages.get(url)
-
         if not content:
             logger.warning(f"[Pipeline] [{i}/{len(urls)}] Skipped (no content): {url}")
             failed_pages += 1
             continue
 
-        # Защита ручных чанков: если URL полностью создан вручную в chunk_editor —
-        # пропускаем его при автоиндексации. Ручные правки важнее автопарсинга.
-        # Чтобы сбросить защиту: откройте URL в chunk_editor и пересохраните
-        # хотя бы один чанк без флага manually_edited, или удалите все чанки URL.
         if url_is_manually_edited(url, collection_name=_col):
             logger.info(f"[Pipeline] [{i}/{len(urls)}] Protected (manually edited): {url}")
             skipped_pages += 1
@@ -312,20 +374,71 @@ def run_indexing(collection_name: Optional[str] = None) -> dict:
             failed_pages += 1
             continue
 
-        question_chunks = generate_question_chunks(chunks)
-        all_chunks = chunks + question_chunks
+        pages_to_index.append((content.url, content.content_hash, content.title, chunks))
+        logger.debug(f"[Pipeline] [{i}/{len(urls)}] Queued: {url} ({len(chunks)} chunks)")
 
-        saved = save_chunks(all_chunks, content.url, content.content_hash,
-                            collection_name=_col)
-        total_pages     += 1
-        total_chunks    += len(chunks)
-        total_questions += len(question_chunks)
+    logger.info(
+        f"[Pipeline] Collection phase done: {len(pages_to_index)} pages to index, "
+        f"{skipped_pages} skipped, {failed_pages} failed"
+    )
 
+    if pages_to_index:
+        # ── 4b: Батч-генерация вопросов для всех страниц разом ───────────
+        # Раньше: N вызовов generate_question_chunks → N event loop'ов.
+        # Теперь: 1 вызов с полным списком чанков → 1 event loop, 1 AsyncOpenAI
+        # клиент, общий семафор — максимальный параллелизм без дублирования.
+        all_text_chunks_flat = [c for _, _, _, chunks in pages_to_index for c in chunks]
         logger.info(
-            f"[Pipeline] [{i}/{len(urls)}] Saved {saved} "
-            f"({len(chunks)} text + {len(question_chunks)} q) "
-            f"for: {content.title or url}"
+            f"[Pipeline] Generating questions for {len(all_text_chunks_flat)} chunks "
+            f"across {len(pages_to_index)} pages..."
         )
+        all_question_chunks = generate_question_chunks(all_text_chunks_flat)
+
+        # Группируем вопрос-чанки обратно по URL
+        q_by_url: dict = {}
+        for qc in all_question_chunks:
+            q_by_url.setdefault(qc.page_url, []).append(qc)
+
+        # ── 4c: Батч-эмбеддинги для всех чанков сразу ────────────────────
+        # Формируем плоский список всех чанков с метаинформацией о срезах.
+        all_chunks_flat: list = []
+        # (url, content_hash, title, n_text, n_questions, slice_start, slice_end)
+        page_slices: list = []
+
+        for url, content_hash, title, text_chunks in pages_to_index:
+            question_chunks = q_by_url.get(url, [])
+            combined = text_chunks + question_chunks
+            start = len(all_chunks_flat)
+            all_chunks_flat.extend(combined)
+            end = len(all_chunks_flat)
+            page_slices.append((url, content_hash, title,
+                                 len(text_chunks), len(question_chunks),
+                                 start, end))
+
+        texts_for_embedding = [
+            c.embed_text if c.embed_text else c.text
+            for c in all_chunks_flat
+        ]
+        total_texts = len(texts_for_embedding)
+        logger.info(
+            f"[Pipeline] Computing embeddings for {total_texts} chunks "
+            f"({len(pages_to_index)} pages) in one batch..."
+        )
+        all_vectors = get_embeddings_batch(texts_for_embedding)
+
+        # ── 4d: Сохранение с готовыми векторами ──────────────────────────
+        for url, content_hash, title, n_txt, n_q, start, end in page_slices:
+            page_chunks  = all_chunks_flat[start:end]
+            page_vectors = all_vectors[start:end]
+            saved = save_chunks_precomputed(
+                page_chunks, page_vectors, url, content_hash, collection_name=_col
+            )
+            total_pages     += 1
+            total_chunks    += n_txt
+            total_questions += n_q
+            logger.info(
+                f"[Pipeline] Saved {saved} ({n_txt} text + {n_q} q) for: {title or url}"
+            )
 
     # ── Шаг 5: Google Docs ───────────────────────────────────────
     all_google_docs = list(settings.GOOGLE_DOC_IDS)
@@ -371,8 +484,11 @@ def run_indexing(collection_name: Optional[str] = None) -> dict:
 
                 question_chunks = generate_question_chunks(chunks)
                 all_doc_chunks  = chunks + question_chunks
-                saved = save_chunks(all_doc_chunks, doc.source_url, content_hash,
-                                    collection_name=_col)
+                # Батч-эмбеддинги — так же как для страниц сайта (оптимизация)
+                doc_texts = [c.embed_text if c.embed_text else c.text for c in all_doc_chunks]
+                doc_vectors = get_embeddings_batch(doc_texts)
+                saved = save_chunks_precomputed(all_doc_chunks, doc_vectors, doc.source_url,
+                                                content_hash, collection_name=_col)
                 total_chunks    += len(chunks)
                 total_questions += len(question_chunks)
 
@@ -396,8 +512,12 @@ def run_indexing(collection_name: Optional[str] = None) -> dict:
 
     # ── Итог ─────────────────────────────────────────────────────
     stats = get_collection_stats(collection_name=_col)
+
+    # Если пришёл SIGTERM — помечаем как прерванную, кеш уже сохранён выше.
+    status = "interrupted" if _shutdown_requested.is_set() else "completed"
+
     result = {
-        "status": "completed",
+        "status": status,
         "collection": _col,
         "pages_indexed": total_pages,
         "pages_skipped": skipped_pages,
@@ -409,18 +529,23 @@ def run_indexing(collection_name: Optional[str] = None) -> dict:
     }
 
     logger.info(
-        f"[Pipeline] Done! pages={total_pages}, skipped={skipped_pages}, "
+        f"[Pipeline] {status.upper()}! pages={total_pages}, skipped={skipped_pages}, "
         f"failed={failed_pages}, chunks={total_chunks}, "
         f"questions={total_questions}, catalog={catalog_saved}, "
         f"total_qdrant={stats['total_chunks']}"
     )
 
-    # Удаляем кеш скачивания — индексация завершена успешно
-    _clear_fetch_cache()
+    if status == "completed":
+        # Удаляем кеш скачивания — индексация завершена успешно
+        _clear_fetch_cache()
+        # Bug #7: сохраняем время завершения индексации.
+        set_last_indexed_at(datetime.now(timezone.utc))
 
-    # Bug #7: сохраняем время завершения индексации.
-    # Следующий запуск сравнит lastmod страниц с этим временем и пропустит
-    # страницы которые не менялись — не нужно их даже скачивать.
-    set_last_indexed_at(datetime.now(timezone.utc))
+    # Восстанавливаем старый SIGTERM handler (если мы его заменяли)
+    if _sigterm_registered and _old_sigterm is not None:
+        try:
+            signal.signal(signal.SIGTERM, _old_sigterm)
+        except Exception:
+            pass
 
     return result

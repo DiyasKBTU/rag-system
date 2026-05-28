@@ -60,18 +60,19 @@ rebuild_manual_knowledge.py — Пересобрать чанки из manual_kn
 import sys
 import os
 
-# Переходим в rag_service чтобы корректно импортировались модули
-os.chdir(os.path.join(os.path.dirname(__file__), "..", "rag_service"))
-sys.path.insert(0, ".")
+# Добавляем rag_service в sys.path но НЕ меняем cwd на уровне модуля —
+# os.chdir() как побочный эффект импорта опасен (меняет cwd всего процесса).
+# Путь вычисляем один раз и вставляем в sys.path.
+_RAG_SERVICE_DIR = os.path.join(os.path.dirname(__file__), "..", "rag_service")
+sys.path.insert(0, os.path.abspath(_RAG_SERVICE_DIR))
 
 from app.logging_setup import setup_logging
-setup_logging("rebuild_manual_knowledge")
-
 from app.indexer.catalog_builder import build_manual_knowledge_catalog
 from app.indexer.storage import ensure_collection_exists, get_collection_stats
 
 
 def main():
+    setup_logging("rebuild_manual_knowledge")
     print("\n" + "=" * 60)
     print("REBUILD MANUAL KNOWLEDGE")
     print("Читаю manual_knowledge.json и пересоздаю чанки...")

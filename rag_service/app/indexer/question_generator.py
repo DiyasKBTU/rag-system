@@ -35,13 +35,8 @@ import sys
 import logging
 from typing import List
 
+import httpx
 from openai import AsyncOpenAI
-
-# Windows + Python 3.12: asyncio.run() закрывает event loop до того как httpx
-# успевает закрыть соединения → RuntimeError: Event loop is closed.
-# WindowsSelectorEventLoopPolicy решает это без изменения логики.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from app.parser.chunker import TextChunk
 from app.config import settings
@@ -64,14 +59,28 @@ _SYSTEM_PROMPT_RU = (
     "Ты помощник для системы поиска информации об университете ЦАИУ (Казахстан). "
     "Генерируй вопросы которые могут задавать абитуриенты и студенты. "
     "Вопросы должны быть краткими, на русском языке. "
-    "Отвечай ТОЛЬКО вопросами, каждый на новой строке, без нумерации и пояснений."
+    "Отвечай ТОЛЬКО вопросами, каждый на новой строке, без нумерации и пояснений.\n\n"
+    "ЗАПРЕЩЕНО генерировать вопросы:\n"
+    "- о дате публикации, дате обновления или дате написания текста\n"
+    "- об авторе текста, редакторе или администраторе сайта\n"
+    "- о технических деталях сайта (URL, разделы, HTML, навигация)\n"
+    "- содержащие слова 'страница', 'раздел', 'сайт', 'текст', 'статья'\n"
+    "Генерируй ТОЛЬКО практические вопросы от абитуриентов/студентов о поступлении, "
+    "специальностях, стоимости, общежитии, документах, учёбе."
 )
 
 _SYSTEM_PROMPT_KK = (
     "Сен ЦАИУ университеті (Қазақстан) туралы ақпарат іздеу жүйесінің көмекшісісің. "
     "Абитуриенттер мен студенттер қоюы мүмкін сұрақтарды жаз. "
     "Сұрақтар қысқа, қазақ тілінде болуы керек. "
-    "ТЕК сұрақтарды жаз, әр жолда бір сұрақ, нөмірсіз."
+    "ТЕК сұрақтарды жаз, әр жолда бір сұрақ, нөмірсіз.\n\n"
+    "ТЫЙЫМ САЛЫНҒАН сұрақтар:\n"
+    "- мәтін жарияланған күн, жаңарту күні туралы\n"
+    "- сайт авторы немесе әкімшісі туралы\n"
+    "- сайттың техникалық бөлімдері туралы\n"
+    "'бет', 'сайт', 'мәтін', 'бөлім' сөздерін қолданба.\n"
+    "ТЕК абитуриент/студент сұрақтары: түсу, мамандық, бағасы, жатақхана, "
+    "құжаттар, оқу туралы."
 )
 
 _USER_PROMPT_TEMPLATE_RU = """Текст из базы знаний:
@@ -118,7 +127,14 @@ def generate_question_chunks(
     чтобы избежать конфликтов когда вызываем из потока (threading.Thread).
     asyncio.run() поднимает RuntimeError если в текущем потоке уже есть
     запущенный loop. Явный loop полностью изолирован.
+
+    Windows + Python 3.12: устанавливаем политику event loop перед созданием
+    нового loop, а не на уровне модуля — чтобы не менять глобальную политику
+    при импорте (это влияло бы на uvicorn).
     """
+    # Windows: применяем только к нашему изолированному loop, не к uvicorn
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(
@@ -135,7 +151,11 @@ async def _generate_all_async(
     questions_per_chunk: int = QUESTIONS_PER_CHUNK,
 ) -> List[TextChunk]:
     """Run all chunk question generation in parallel with a semaphore."""
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = AsyncOpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+        max_retries=2,
+    )
     semaphore = asyncio.Semaphore(BATCH_CONCURRENCY)
 
     tasks = [

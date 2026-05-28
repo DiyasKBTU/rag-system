@@ -23,8 +23,10 @@ main.py - FastAPI сервер RAG-сервиса.
 import asyncio
 import json
 import logging
+import secrets
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -51,6 +53,16 @@ import portalocker
 MAX_CONCURRENT_SEARCHES = 20
 _search_semaphore: "asyncio.Semaphore | None" = None  # создаётся лениво в lifespan
 
+# Размер default-executor для asyncio.to_thread.
+# Зачем не дефолт:
+#   asyncio по умолчанию: min(32, os.cpu_count() + 4) → на 2-ядерной VPS = 6 потоков.
+#   В search.search() мы делаем 2 to_thread (search + get_candidate_urls).
+#   При семафоре в 20 слотов и 6 потоках threadpool становится бутылочным горлом:
+#   часть запросов ждёт поток вместо того чтобы реально работать.
+# 32 потока спокойно укладываются в RAM (~8 МБ stack каждый), позволяя
+# реализовать заявленную параллельность семафора без неявных ограничений.
+_THREADPOOL_SIZE = 32
+
 from app.logging_setup import setup_logging
 setup_logging("api")
 from typing import List, Optional
@@ -58,6 +70,57 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# ── Prometheus метрики ────────────────────────────────────────────────────────
+# prometheus_client — стандартная библиотека для экспорта метрик в Prometheus.
+# Если она не установлена — метрики недоступны, но сервис работает нормально.
+#
+# Доступные метрики:
+#   caiu_search_total          — счётчик поисков (labels: status=ok/empty/error)
+#   caiu_search_latency_seconds — гистограмма латентности поиска
+#   caiu_semaphore_waiting     — gauge текущего числа запросов в очереди на семафор
+#   caiu_indexing_runs_total   — счётчик запусков индексации (labels: trigger=api/scheduler)
+#   caiu_indexing_errors_total — счётчик ошибок индексации
+#
+# Установка: pip install prometheus_client
+# Метрики доступны на GET /metrics (без авторизации — только для localhost).
+try:
+    from prometheus_client import (
+        Counter, Histogram, Gauge,
+        generate_latest, CONTENT_TYPE_LATEST,
+    )
+    _PROMETHEUS_AVAILABLE = True
+
+    _search_total = Counter(
+        "caiu_search_total",
+        "Total number of /search requests",
+        ["status"],  # ok | empty | error
+    )
+    _search_latency = Histogram(
+        "caiu_search_latency_seconds",
+        "Search request latency",
+        buckets=[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+    )
+    _semaphore_waiting = Gauge(
+        "caiu_semaphore_waiting",
+        "Number of /search requests waiting for semaphore slot",
+    )
+    _indexing_runs = Counter(
+        "caiu_indexing_runs_total",
+        "Total number of hot-swap indexing runs started",
+        ["trigger"],  # api | scheduler
+    )
+    _indexing_errors = Counter(
+        "caiu_indexing_errors_total",
+        "Total number of indexing errors",
+    )
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+    logger_bootstrap = __import__("logging").getLogger(__name__)
+    logger_bootstrap.warning(
+        "[Metrics] prometheus_client not installed — /metrics endpoint unavailable. "
+        "Install: pip install prometheus_client"
+    )
 
 from app.config import settings
 from app.retrieval.search import search, format_results_as_context, get_candidate_urls
@@ -192,6 +255,10 @@ async def _scheduler_loop() -> None:
     """
     logger.info("[Scheduler] Background scheduler started (checks every 30s)")
     while True:
+        # Инициализируем в начале каждой итерации — переменные в Python
+        # персистентны между итерациями while True, поэтому без сброса
+        # fire_indexing от предыдущей итерации может остаться True.
+        fire_indexing = False
         try:
             # Дешёвая предпроверка БЕЗ lock'a — большую часть времени
             # расписания нет или время не пришло. Lock берём только когда
@@ -232,12 +299,15 @@ async def _scheduler_loop() -> None:
                                     )
 
                                     is_recurring = schedule.get("recurring", False)
-                                    schedule["fired"] = True
-                                    schedule["fired_at"] = datetime.now(timezone.utc).isoformat()
-                                    _write_schedule(schedule)
 
-                                    # Если recurring — сразу записываем следующий запуск,
-                                    # пока держим lock (атомарно с пометкой fired).
+                                    # Для recurring: сначала пишем СЛЕДУЮЩИЙ запуск,
+                                    # потом помечаем текущий как fired.
+                                    # Порядок важен: если процесс крашнется между
+                                    # двумя записями — лучше потерять пометку fired
+                                    # (scheduler срабатывает ещё раз, что безопасно —
+                                    # file lock не даст двойной индексации), чем
+                                    # потерять следующий запуск (ежедневная индексация
+                                    # просто прекратится без алерта).
                                     if is_recurring:
                                         next_dt = scheduled_dt + timedelta(days=1)
                                         if next_dt <= now:
@@ -260,9 +330,16 @@ async def _scheduler_loop() -> None:
                                             f"{next_dt.strftime('%d.%m.%Y %H:%M')}"
                                         )
 
+                                    # Пишем fired=True ПОСЛЕ записи следующего расписания
+                                    schedule["fired"] = True
+                                    schedule["fired_at"] = datetime.now(timezone.utc).isoformat()
+                                    _write_schedule(schedule)
+
                                     # Запускаем индексацию ПОСЛЕ освобождения lock'а
                                     # (см. ниже). Сама индексация возьмёт свой собственный
                                     # межпроцессный lock в hot_swap.
+                                    if _PROMETHEUS_AVAILABLE:
+                                        _indexing_runs.labels(trigger="scheduler").inc()
                                     fire_indexing = True
                                 else:
                                     fire_indexing = False
@@ -275,7 +352,7 @@ async def _scheduler_loop() -> None:
                         _release_scheduler_lock(lock_fh)
 
                     # Стартуем индексацию ВНЕ lock'а
-                    if 'fire_indexing' in locals() and fire_indexing:
+                    if fire_indexing:
                         from app.indexer.hot_swap import run_shadow_indexing
                         t = threading.Thread(
                             target=run_shadow_indexing,
@@ -306,6 +383,16 @@ async def lifespan(app: FastAPI):
     _search_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
     logger.info(f"Search semaphore initialised: {MAX_CONCURRENT_SEARCHES} slots")
 
+    # Явный executor для asyncio.to_thread. См. _THREADPOOL_SIZE выше:
+    # без этого дефолтный пул может стать узким местом при пиковой нагрузке.
+    loop = asyncio.get_running_loop()
+    custom_executor = ThreadPoolExecutor(
+        max_workers=_THREADPOOL_SIZE,
+        thread_name_prefix="rag-worker",
+    )
+    loop.set_default_executor(custom_executor)
+    logger.info(f"Default executor: ThreadPoolExecutor(max_workers={_THREADPOOL_SIZE})")
+
     try:
         ensure_collection_exists()
         stats = get_collection_stats()
@@ -320,6 +407,12 @@ async def lifespan(app: FastAPI):
     yield  # Server is running
 
     scheduler_task.cancel()
+    # Аккуратно гасим executor (ждём активные таски, не принимаем новые).
+    # wait=False — uvicorn уже идёт на выход, не блокируем shutdown.
+    try:
+        custom_executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     logger.info("RAG service shutting down.")
 
 
@@ -350,8 +443,13 @@ def verify_api_key(x_api_key: str = Header(..., description="Secret API key")):
     Bot sends this key in every request header.
 
     Usage: add  X-API-Key: your_secret_key  to request headers.
+
+    Сравнение через secrets.compare_digest — constant-time, защита от timing
+    attack (атакующий, замеряя время ответа, может постепенно угадать ключ
+    байт за байтом, если использовать обычное ==).
     """
-    if x_api_key != settings.API_SECRET_KEY:
+    expected = settings.API_SECRET_KEY or ""
+    if not x_api_key or not secrets.compare_digest(x_api_key, expected):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key
 
@@ -466,11 +564,76 @@ class ScheduleResponse(BaseModel):
 @app.get("/health")
 def health_check():
     """
-    Simple health check - no auth required.
-    Returns 200 if server is alive.
-    Used by monitoring tools, load balancers, etc.
+    Health check — no auth required.
+    Проверяет Qdrant и Redis. Возвращает 200 если сервис работает,
+    200 с degraded=True если один из компонентов недоступен,
+    503 если Qdrant (критический) недоступен.
+
+    Используется systemd-watchdog и внешним мониторингом.
     """
-    return {"status": "ok", "service": "CAIU RAG Service"}
+    from app.indexer.storage import get_client
+    from app.redis_client import get_redis, is_redis_available
+
+    components: dict = {}
+    overall_ok = True
+
+    # ── Qdrant (критический компонент — без него поиск невозможен) ────────────
+    try:
+        client = get_client()
+        client.get_collections()  # лёгкий запрос, не трогает данные
+        components["qdrant"] = "ok"
+    except Exception as e:
+        components["qdrant"] = f"error: {e}"
+        overall_ok = False
+
+    # ── Redis (некритический — без него кеши просто не работают) ─────────────
+    try:
+        r = get_redis()
+        if r is not None:
+            r.ping()
+            components["redis"] = "ok"
+        else:
+            components["redis"] = "unavailable"
+    except Exception as e:
+        components["redis"] = f"error: {e}"
+
+    status_code = 200 if overall_ok else 503
+    body = {
+        "status": "ok" if overall_ok else "degraded",
+        "service": "CAIU RAG Service",
+        "components": components,
+    }
+
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content=body, status_code=status_code)
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """
+    Prometheus metrics endpoint — no auth required.
+    Возвращает метрики в формате Prometheus text exposition.
+
+    Подключение к Prometheus (prometheus.yml):
+        scrape_configs:
+          - job_name: 'caiu-rag'
+            static_configs:
+              - targets: ['localhost:8001']
+
+    Метрики:
+      caiu_search_total{status="ok|empty|error"}
+      caiu_search_latency_seconds (histogram)
+      caiu_semaphore_waiting (gauge)
+      caiu_indexing_runs_total{trigger="api|scheduler"}
+      caiu_indexing_errors_total
+    """
+    if not _PROMETHEUS_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="prometheus_client not installed. Run: pip install prometheus_client",
+        )
+    from fastapi.responses import Response
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -531,14 +694,22 @@ async def search_endpoint(
     # Ждём слота в семафоре — без блокировки потока threadpool.
     # При перегрузке (все 20 слотов заняты дольше 20 сек) — отказ 503,
     # чтобы клиент мог отступить и попробовать снова.
+    if _PROMETHEUS_AVAILABLE:
+        _semaphore_waiting.inc()
     try:
         await asyncio.wait_for(_search_semaphore.acquire(), timeout=20.0)
     except asyncio.TimeoutError:
         logger.warning("Search semaphore timeout — too many concurrent requests")
+        if _PROMETHEUS_AVAILABLE:
+            _semaphore_waiting.dec()
+            _search_total.labels(status="error").inc()
         raise HTTPException(
             status_code=503,
             detail="Сервис перегружен, попробуйте через несколько секунд.",
         )
+    finally:
+        if _PROMETHEUS_AVAILABLE:
+            _semaphore_waiting.dec()
 
     try:
         # search() — блокирующая (sync OpenAI, sync Qdrant), запускаем в threadpool.
@@ -574,6 +745,11 @@ async def search_endpoint(
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.info(f"Found {len(results)} chunks in {elapsed_ms}ms")
 
+        # ── Prometheus инструментация ──────────────────────────────
+        if _PROMETHEUS_AVAILABLE:
+            _search_latency.observe(elapsed_ms / 1000)
+            _search_total.labels(status="ok" if results else "empty").inc()
+
         return SearchResponse(
             question=question,
             context=context,
@@ -594,6 +770,8 @@ async def search_endpoint(
 
     except Exception as e:
         logger.error(f"Search failed: {e}", exc_info=True)
+        if _PROMETHEUS_AVAILABLE:
+            _search_total.labels(status="error").inc()
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
     finally:
         _search_semaphore.release()
@@ -638,6 +816,9 @@ def index_endpoint(
         )
 
     logger.info(f"Index request received. background={request.background}")
+
+    if _PROMETHEUS_AVAILABLE:
+        _indexing_runs.labels(trigger="api").inc()
 
     if request.background:
         background_tasks.add_task(_run_hot_swap_indexing)

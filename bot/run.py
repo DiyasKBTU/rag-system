@@ -21,8 +21,10 @@ bot/run.py — Telegram-бот приёмной комиссии ЦАИУ.
 
 import asyncio
 import hashlib
+import html
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -37,6 +39,13 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+# RedisStorage импортируем «мягко» — если redis недоступен (например, пакета нет
+# или Docker не запущен), используем MemoryStorage. Так бот всё равно стартует.
+try:
+    from aiogram.fsm.storage.redis import RedisStorage
+    _REDIS_STORAGE_AVAILABLE = True
+except Exception:
+    _REDIS_STORAGE_AVAILABLE = False
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -101,7 +110,24 @@ _setup_logging()
 logger = logging.getLogger(__name__)
 
 # ── OpenAI клиент ─────────────────────────────────────────────────────────────
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Таймауты важны: без них зависший запрос к OpenAI держит корутину бесконечно
+# и съедает слот httpx connection pool. При пиковой нагрузке (десятки
+# одновременных пользователей) накопление зависших корутин = деградация бота.
+#
+#   connect=5  — TCP-handshake до OpenAI обычно <1с, 5с с большим запасом
+#   read=45    — streaming-ответ GPT длинный: 700 max_tokens × ~25 ms/token
+#                + сетевая задержка. 30с может не хватить для длинных ответов.
+#   write=10   — отправка system prompt + истории (несколько КБ)
+#   pool=5     — ожидание свободного коннекта в httpx pool
+#
+# max_retries=2: библиотека OpenAI сама ретраит на 429/5xx с exponential backoff.
+# Streaming ретраит только до получения первого токена.
+_openai_timeout = httpx.Timeout(connect=5.0, read=45.0, write=10.0, pool=5.0)
+openai_client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=_openai_timeout,
+    max_retries=2,
+)
 
 # ── Async Redis клиент для бота ───────────────────────────────────────────────
 # Используется для персистентного кеша переводов (TTL 30 дней).
@@ -113,6 +139,19 @@ _REDIS_TRANS_PREFIX = "caiu:trans:"
 
 _async_redis      = None
 _redis_available  = None   # None = ещё не проверяли
+# Lock защищает от двойной инициализации Redis при первом параллельном запросе.
+# Без него N одновременных корутин могут попасть в "if _async_redis is None" и
+# создать N клиентов (каждый со своим TCP-соединением).
+# Lock создаётся лениво — нельзя на module-level, иначе он привяжется к чужому
+# event loop.
+_redis_init_lock: asyncio.Lock | None = None
+
+
+def _get_redis_init_lock() -> asyncio.Lock:
+    global _redis_init_lock
+    if _redis_init_lock is None:
+        _redis_init_lock = asyncio.Lock()
+    return _redis_init_lock
 
 
 async def _get_async_redis():
@@ -122,22 +161,29 @@ async def _get_async_redis():
         return None
     if _async_redis is not None:
         return _async_redis
-    try:
-        import redis.asyncio as aioredis
-        r = aioredis.Redis(
-            host=_REDIS_HOST, port=_REDIS_PORT,
-            decode_responses=True,
-            socket_connect_timeout=2,
-        )
-        await r.ping()
-        _async_redis = r
-        _redis_available = True
-        logger.info(f"[Redis] Async клиент подключён: {_REDIS_HOST}:{_REDIS_PORT}")
-        return _async_redis
-    except Exception as e:
-        _redis_available = False
-        logger.warning(f"[Redis] Async недоступен ({e}) — кеш переводов только in-memory")
-        return None
+
+    async with _get_redis_init_lock():
+        # double-check: пока ждали lock, другая корутина могла уже инициализировать
+        if _async_redis is not None:
+            return _async_redis
+        if _redis_available is False:
+            return None
+        try:
+            import redis.asyncio as aioredis
+            r = aioredis.Redis(
+                host=_REDIS_HOST, port=_REDIS_PORT,
+                decode_responses=True,
+                socket_connect_timeout=2,
+            )
+            await r.ping()
+            _async_redis = r
+            _redis_available = True
+            logger.info(f"[Redis] Async клиент подключён: {_REDIS_HOST}:{_REDIS_PORT}")
+            return _async_redis
+        except Exception as e:
+            _redis_available = False
+            logger.warning(f"[Redis] Async недоступен ({e}) — кеш переводов только in-memory")
+            return None
 
 
 # ── HTTP клиент для RAG-сервиса ───────────────────────────────────────────────
@@ -148,6 +194,16 @@ async def _get_async_redis():
 #     (embedding + Qdrant иногда занимает 10-15с при нагрузке на OpenAI)
 _RAG_TIMEOUT = httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0)
 _rag_client: httpx.AsyncClient | None = None
+# Lock на пересоздание клиента — иначе при ConnectError несколько корутин
+# параллельно обнулят _rag_client и создадут несколько новых.
+_rag_client_lock: asyncio.Lock | None = None
+
+
+def _get_rag_client_lock() -> asyncio.Lock:
+    global _rag_client_lock
+    if _rag_client_lock is None:
+        _rag_client_lock = asyncio.Lock()
+    return _rag_client_lock
 
 
 def _get_rag_client() -> httpx.AsyncClient:
@@ -158,6 +214,11 @@ def _get_rag_client() -> httpx.AsyncClient:
       max_keepalive_connections=10 — держим 10 соединений открытыми между запросами
     RAG-сервис ограничивает параллельность сам (семафор MAX_CONCURRENT_SEARCHES),
     поэтому 30 соединений здесь не приведут к перегрузке OpenAI.
+
+    Безопасно вызывать конкурентно: создание клиента не требует await, поэтому
+    GIL гарантирует, что только один из конкурентных вызовов попадёт в ветку
+    создания. Lock используется в _reset_rag_client_locked() ниже — там
+    важна именно сериализация relinquish + recreate.
     """
     global _rag_client
     if _rag_client is None or _rag_client.is_closed:
@@ -166,6 +227,33 @@ def _get_rag_client() -> httpx.AsyncClient:
             limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
         )
     return _rag_client
+
+
+async def _reset_rag_client_locked() -> httpx.AsyncClient:
+    """
+    Закрывает текущий httpx клиент и создаёт новый. Используется при ConnectError
+    к RAG-сервису (например, после рестарта RAG). Под asyncio.Lock — чтобы
+    при 30 параллельных запросах с ошибкой не было N одновременных пересозданий.
+    """
+    global _rag_client
+    async with _get_rag_client_lock():
+        # double-check: пока ждали lock, кто-то мог уже пересоздать
+        if _rag_client is not None and not _rag_client.is_closed:
+            try:
+                # Проверим живой ли — если да, возвращаем как есть
+                return _rag_client
+            except Exception:
+                pass
+        if _rag_client is not None:
+            try:
+                await _rag_client.aclose()
+            except Exception:
+                pass
+        _rag_client = httpx.AsyncClient(
+            timeout=_RAG_TIMEOUT,
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
+        )
+        return _rag_client
 
 
 # ── Казахские буквы которых нет в русском ────────────────────────────────────
@@ -178,6 +266,24 @@ _KAZAKH_CHARS = frozenset("әғқңөұүһіӘҒҚҢӨҰҮҺІ")
 _TRANSLATION_CACHE: OrderedDict = OrderedDict()
 _TRANSLATION_CACHE_MAX = 500
 
+# Вспомогательный кеш прогрева: {redis_key → translated_text}.
+# Заполняется при старте бота из Redis scan (translate_to_russian записей).
+# Проверяется в translate_to_russian после вычисления redis_key — до обращения
+# к Redis. Записи вытесняются в _TRANSLATION_CACHE при первом реальном обращении.
+_TRANSLATION_WARMUP_CACHE: dict = {}
+
+# ── Ограничение длины вопроса ─────────────────────────────────────────────────
+# Telegram позволяет до 4096 симв. Без ограничения злоумышленник может отправлять
+# длинные тексты, сжигая квоту OpenAI (embedding + перевод + GPT).
+# 1000 симв. ≈ 200 слов — с запасом для самых длинных реальных вопросов.
+_MAX_QUESTION_LENGTH = 1000
+
+_TOO_LONG_MSG = {
+    "kk": "⚠️ Сұрақ тым ұзын. 1000 таңбадан аз жазыңыз.",
+    "ru": "⚠️ Вопрос слишком длинный. Пожалуйста, сократите до 1000 символов.",
+    "en": "⚠️ Question is too long. Please shorten it to 1000 characters.",
+}
+
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 # Защита от спама и случайного сжигания бюджета OpenAI.
 _RATE_LIMIT_MESSAGES = 10   # максимум сообщений
@@ -189,8 +295,17 @@ _rate_limit_lock: threading.Lock = threading.Lock()   # защита от race c
 
 # ── Отслеживание первого входа ────────────────────────────────────────────────
 # Пользователи которые уже видели приветствие.
-# Сбрасывается при перезапуске бота (это нормально, т.к. MemoryStorage тоже сбрасывается).
-_greeted_users: set = set()
+# Хранится как {user_id: timestamp последней активности} — для TTL-очистки.
+# Через сутки запись «протухает»; пользователь снова увидит полное приветствие.
+# Это нормально (UX не страдает) и предотвращает утечку памяти на длинной дистанции.
+_GREETED_TTL_SECONDS = 24 * 3600
+_greeted_users: dict = {}      # {user_id: last_seen_ts}
+_greeted_lock: threading.Lock = threading.Lock()
+
+# Период (сек) фоновой очистки in-memory словарей от мёртвых ключей.
+# При тысячах разных пользователей за месяцы defaultdict разрастается даже
+# когда списки timestamps пустые — каждая запись съедает ~200 байт.
+_MEMORY_CLEANUP_INTERVAL = 600   # раз в 10 минут
 
 # ── Тексты интерфейса ─────────────────────────────────────────────────────────
 LANGS = {
@@ -375,17 +490,67 @@ def _is_rate_limited(user_id: int) -> bool:
     """
     Проверяет не превысил ли пользователь лимит запросов.
     Возвращает True если нужно заблокировать сообщение.
+
+    Примечание: после очистки старых timestamps, если список пустой,
+    ключ удаляется. Это предотвращает рост _user_timestamps в памяти
+    при тысячах одноразовых пользователей — без удаления defaultdict
+    хранил бы пустой список для каждого user_id навсегда.
     """
     now = time.time()
     with _rate_limit_lock:
-        _user_timestamps[user_id] = [
-            t for t in _user_timestamps[user_id]
-            if now - t < _RATE_LIMIT_WINDOW
-        ]
-        if len(_user_timestamps[user_id]) >= _RATE_LIMIT_MESSAGES:
+        fresh = [t for t in _user_timestamps[user_id] if now - t < _RATE_LIMIT_WINDOW]
+        if len(fresh) >= _RATE_LIMIT_MESSAGES:
+            _user_timestamps[user_id] = fresh
             return True
-        _user_timestamps[user_id].append(now)
+        fresh.append(now)
+        _user_timestamps[user_id] = fresh
         return False
+
+
+def _cleanup_in_memory_state() -> None:
+    """
+    Удаляет из _user_timestamps и _greeted_users записи, по которым давно
+    не было активности. Запускается из фонового asyncio-task раз в
+    _MEMORY_CLEANUP_INTERVAL секунд.
+
+    Без этого defaultdict + set росли бы навсегда: каждый зашедший хоть раз
+    юзер занимал бы память до перезапуска бота.
+    """
+    now = time.time()
+    # _user_timestamps: убираем тех, у кого нет недавних запросов
+    with _rate_limit_lock:
+        stale = [uid for uid, ts_list in _user_timestamps.items()
+                 if not ts_list or all(now - t >= _RATE_LIMIT_WINDOW for t in ts_list)]
+        for uid in stale:
+            _user_timestamps.pop(uid, None)
+        rl_removed = len(stale)
+
+    # _greeted_users: TTL по timestamp
+    with _greeted_lock:
+        stale_g = [uid for uid, ts in _greeted_users.items()
+                   if now - ts >= _GREETED_TTL_SECONDS]
+        for uid in stale_g:
+            _greeted_users.pop(uid, None)
+        g_removed = len(stale_g)
+
+    if rl_removed or g_removed:
+        logger.info(
+            f"[Cleanup] Removed {rl_removed} stale rate-limit entries, "
+            f"{g_removed} stale greeted-user entries "
+            f"(rl_size={len(_user_timestamps)}, greeted_size={len(_greeted_users)})"
+        )
+
+
+async def _memory_cleanup_loop() -> None:
+    """Фоновый цикл очистки in-memory словарей. Стартует в main()."""
+    while True:
+        try:
+            await asyncio.sleep(_MEMORY_CLEANUP_INTERVAL)
+            _cleanup_in_memory_state()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"[Cleanup] loop error: {e}")
 
 
 # ── Кеш переводов (LRU) ───────────────────────────────────────────────────────
@@ -451,11 +616,9 @@ async def get_rag_context(question: str) -> tuple[str, list[dict]]:
 
         except httpx.ConnectError as e:
             logger.error(f"[RAG] Нет подключения к {RAG_SERVICE_URL} (попытка {attempt}): {e}")
-            global _rag_client
-            if _rag_client and not _rag_client.is_closed:
-                await _rag_client.aclose()
-            _rag_client = None
-            client = _get_rag_client()
+            # Пересоздание клиента — под asyncio.Lock'ом, чтобы 30 параллельных
+            # запросов с ошибкой не пересоздали клиента 30 раз.
+            client = await _reset_rag_client_locked()
 
         except httpx.TimeoutException:
             logger.warning(f"[RAG] Таймаут (попытка {attempt}/{_RAG_RETRY_ATTEMPTS})")
@@ -465,8 +628,17 @@ async def get_rag_context(question: str) -> tuple[str, list[dict]]:
 
         if attempt < _RAG_RETRY_ATTEMPTS:
             delay = _RAG_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-            logger.info(f"[RAG] Повтор через {delay:.1f}с...")
-            await asyncio.sleep(delay)
+            # Jitter ±30%: при массовых 503 (семафор RAG переполнен) все боты
+            # без jitter повторяют запросы синхронно → thundering herd усугубляется.
+            # С jitter повторные запросы размазываются по времени.
+            jitter = random.uniform(-delay * 0.3, delay * 0.3)
+            # При явной перегрузке сервиса (503) ждём вдвое дольше обычного
+            is_503 = 'resp' in locals() and hasattr(resp, 'status_code') and resp.status_code == 503
+            if is_503:
+                delay *= 2
+            total_delay = max(0.5, delay + jitter)
+            logger.info(f"[RAG] Повтор через {total_delay:.1f}с (503={is_503}, jitter={jitter:+.1f})...")
+            await asyncio.sleep(total_delay)
 
     logger.error(f"[RAG] Все {_RAG_RETRY_ATTEMPTS} попытки исчерпаны")
     return "", []
@@ -488,8 +660,15 @@ async def translate_to_russian(text: str, source_lang: str) -> str:
     if cached is not None:
         return cached
 
-    # Уровень 2: Redis
+    # Уровень 2: warmup-кеш (redis_key → value, заполнен при старте)
     redis_key = _REDIS_TRANS_PREFIX + source_lang + ":" + hashlib.md5(text.encode()).hexdigest()
+    warmed = _TRANSLATION_WARMUP_CACHE.pop(redis_key, None)
+    if warmed:
+        _cache_set(cache_key, warmed)
+        logger.debug(f"[Translate] Warmup hit [{source_lang}]: '{text[:40]}'")
+        return warmed
+
+    # Уровень 3: Redis
     r = await _get_async_redis()
     if r:
         try:
@@ -501,7 +680,7 @@ async def translate_to_russian(text: str, source_lang: str) -> str:
         except Exception as e:
             logger.debug(f"[Redis] Translate get failed: {e}")
 
-    # Уровень 3: GPT
+    # Уровень 4: GPT
     lang_name = "казахского" if source_lang == "kk" else "английского"
     try:
         resp = await openai_client.chat.completions.create(
@@ -511,7 +690,11 @@ async def translate_to_russian(text: str, source_lang: str) -> str:
                 {"role": "user",   "content": text},
             ],
             temperature=0.0,
-            max_tokens=200,
+            # 800 токенов с запасом на длинные вопросы абитуриентов
+            # (часто пишут в 2-3 предложения по-казахски). Раньше было 200 —
+            # обрезалось на длинных вопросах, RAG потом искал по обрывку.
+            # Стоимость прироста минимальна — это input-токены × дешёвая модель.
+            max_tokens=800,
         )
         translated = resp.choices[0].message.content.strip()
         _cache_set(cache_key, translated)
@@ -743,12 +926,17 @@ async def stream_answer_to_message(
                     except Exception:
                         pass
 
-        # Финальное редактирование — полный текст с parse_mode
+        # Финальное редактирование — полный текст с parse_mode.
+        # GPT не использует HTML-разметку (в системном промпте мы её не разрешали),
+        # поэтому экранируем спецсимволы — иначе случайные '<', '>', '&'
+        # в ответе модели сломают HTML-парсер Telegram и сообщение откатится
+        # к промежуточной версии (или вообще к "⏳").
         if accumulated:
             try:
-                await placeholder.edit_text(accumulated, parse_mode="HTML")
+                await placeholder.edit_text(html.escape(accumulated), parse_mode="HTML")
             except Exception:
-                # HTML парсинг может упасть если GPT сгенерировал незакрытый тег
+                # Если даже escape-версия не прошла (например, длиннее 4096 симв.)
+                # — пробуем без parse_mode
                 try:
                     await placeholder.edit_text(accumulated)
                 except Exception:
@@ -822,12 +1010,6 @@ _CANDIDATE_LINKS_HEADER = {
 }
 
 
-def _send_candidate_links(candidate_urls: list[dict], lang: str) -> None:
-    """Логирует кандидатов для отладки."""
-    urls = [c.get("url", "") for c in candidate_urls]
-    logger.info(f"[Candidates] Showing {len(urls)} links: {urls}")
-
-
 def _format_candidate_links(candidate_urls: list[dict], lang: str) -> str:
     """
     Форматирует список кандидатов в HTML-сообщение.
@@ -869,7 +1051,12 @@ def _format_candidate_links(candidate_urls: list[dict], lang: str) -> str:
         if len(title) > 60:
             title = title[:57] + "…"
 
-        lines.append(f'• <a href="{url}">{title}</a>')
+        # Экранируем title и url: '&', '<', '>' в реальных URL/заголовках страниц
+        # ломают HTML-парсер Telegram → сообщение полностью отклоняется.
+        # quote=True эскейпит и кавычки — обязательно внутри href="...".
+        url_safe   = html.escape(url, quote=True)
+        title_safe = html.escape(title, quote=False)
+        lines.append(f'• <a href="{url_safe}">{title_safe}</a>')
 
         # Показываем внешние документы найденные на этой странице
         for ext_url in ext[:2]:   # максимум 2 внешних ссылки на страницу
@@ -885,7 +1072,8 @@ def _format_candidate_links(candidate_urls: list[dict], lang: str) -> str:
                 link_text = "Файл документа"
             else:
                 link_text = "Внешний документ"
-            lines.append(f'  {ext_label} <a href="{ext_url}">{link_text}</a>')
+            ext_url_safe = html.escape(ext_url, quote=True)
+            lines.append(f'  {ext_label} <a href="{ext_url_safe}">{link_text}</a>')
 
     if len(lines) == 1:
         return ""  # нет ни одной валидной ссылки
@@ -901,8 +1089,14 @@ router = Router()
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_id = message.from_user.id
-    if user_id not in _greeted_users:
-        _greeted_users.add(user_id)
+    now = time.time()
+    with _greeted_lock:
+        last_seen = _greeted_users.get(user_id)
+        # «Уже здоровались» — если запись есть и не протухла по TTL
+        already_greeted = last_seen is not None and (now - last_seen) < _GREETED_TTL_SECONDS
+        _greeted_users[user_id] = now   # обновляем активность в любом случае
+
+    if not already_greeted:
         await message.answer(T["greet"], parse_mode="HTML")
         await message.answer(T["choose_lang"], parse_mode="HTML", reply_markup=lang_keyboard())
     else:
@@ -975,7 +1169,10 @@ async def handle_faq_button(callback: CallbackQuery, state: FSMContext, bot: Bot
         if not used_rag and candidate_urls:
             suffix = _format_candidate_links(candidate_urls, lang)
             if suffix:
-                full_text = answer + "\n\n" + suffix
+                # answer от GPT — сырой текст, suffix — уже валидный HTML.
+                # Эскейпим только answer, чтобы '<', '>', '&' в ответе модели
+                # не сломали parse_mode="HTML".
+                full_text = html.escape(answer) + "\n\n" + suffix
                 try:
                     await placeholder.edit_text(
                         full_text, parse_mode="HTML", disable_web_page_preview=True
@@ -1025,6 +1222,12 @@ async def handle_message(message: Message, state: FSMContext, bot: Bot) -> None:
     except Exception:
         pass  # не блокируем если Telegram временно недоступен
 
+    # Проверка длины вопроса — защита от намеренно длинных запросов
+    if len(text) > _MAX_QUESTION_LENGTH:
+        logger.warning(f"[LengthLimit] user_id={message.from_user.id} длина={len(text)} симв.")
+        await message.answer(_TOO_LONG_MSG[lang])
+        return
+
     # Rate limit — защита от спама
     if _is_rate_limited(message.from_user.id):
         logger.warning(f"[RateLimit] user_id={message.from_user.id} превысил лимит")
@@ -1043,22 +1246,35 @@ async def handle_message(message: Message, state: FSMContext, bot: Bot) -> None:
             text, lang, placeholder, history=history
         )
         rag_status = "RAG=YES" if used_rag else "RAG=NO"
-        logger.info(f"[Answer] user={message.from_user.id} lang={lang} {rag_status}")
+        # Логируем сам вопрос (обрезанный) — без него при разборе жалоб
+        # пользователей приходится сопоставлять время Telegram и сервера.
+        # !r ставит кавычки и эскейпит спецсимволы.
+        q_short = text[:120] + ("…" if len(text) > 120 else "")
+        logger.info(
+            f"[Answer] user={message.from_user.id} lang={lang} {rag_status} q={q_short!r}"
+        )
 
         # Когда бот не нашёл уверенного ответа — ссылки на страницы-кандидаты
         # вставляются прямо в основной ответ (одно сообщение вместо двух).
         if not used_rag and candidate_urls:
-            _send_candidate_links(candidate_urls, lang)
+            logger.info(f"[Candidates] Showing {len(candidate_urls)} links: {[c.get('url','') for c in candidate_urls]}")
             suffix = _format_candidate_links(candidate_urls, lang)
             if suffix:
-                full_text = answer + "\n\n" + suffix
+                # answer от GPT — сырой, suffix — HTML с экранированными URL/title.
+                # Эскейпим answer чтобы spec-символы не сломали parse_mode="HTML".
+                escaped_answer = html.escape(answer)
+                full_text = escaped_answer + "\n\n" + suffix
                 try:
                     await placeholder.edit_text(
                         full_text, parse_mode="HTML", disable_web_page_preview=True
                     )
                 except Exception:
+                    # Fallback без HTML — суффикс с тегами тут отрендерится как
+                    # текст, но пользователь хотя бы увидит ответ.
                     try:
-                        await placeholder.edit_text(full_text, disable_web_page_preview=True)
+                        await placeholder.edit_text(
+                            answer + "\n\n" + suffix, disable_web_page_preview=True
+                        )
                     except Exception:
                         pass
 
@@ -1097,14 +1313,83 @@ async def main() -> None:
         logger.info(f"Telegram proxy: {TELEGRAM_PROXY}")
 
     bot = Bot(token=BOT_TOKEN, session=session)
-    dp  = Dispatcher(storage=MemoryStorage())
+
+    # FSM storage: пробуем Redis, при ошибке откатываемся к MemoryStorage.
+    # Почему Redis важен:
+    #   MemoryStorage теряет всё состояние при рестарте бота. Пользователи
+    #   которые были в Chat.waiting (выбрали язык, ждут ответа) после рестарта
+    #   попадут в fallback — их сообщение не будет распознано как вопрос.
+    #   История диалога (UX #10) тоже теряется.
+    # С Redis: FSM-state и history переживают рестарт; пользователь не замечает.
+    fsm_storage = None
+    if _REDIS_STORAGE_AVAILABLE:
+        try:
+            # Используем DB=1 чтобы не пересекаться с кешем эмбеддингов (DB=0).
+            fsm_storage = RedisStorage.from_url(
+                f"redis://{_REDIS_HOST}:{_REDIS_PORT}/1"
+            )
+            # ping — убедиться что Redis реально доступен (импорт пакета сам по
+            # себе ничего не гарантирует, Docker может быть выключен).
+            await fsm_storage.redis.ping()
+            logger.info(f"FSM storage: Redis ({_REDIS_HOST}:{_REDIS_PORT}/1)")
+        except Exception as e:
+            logger.warning(
+                f"FSM storage: Redis недоступен ({e}) — fallback на MemoryStorage. "
+                f"При рестарте бота состояние диалогов будет потеряно."
+            )
+            fsm_storage = None
+    if fsm_storage is None:
+        fsm_storage = MemoryStorage()
+        if not _REDIS_STORAGE_AVAILABLE:
+            logger.info("FSM storage: MemoryStorage (aiogram redis-extra не установлен)")
+
+    dp = Dispatcher(storage=fsm_storage)
     dp.include_router(router)
+
+    # ── Прогрев translation cache из Redis ────────────────────────────────────
+    # При рестарте in-memory LRU (_TRANSLATION_CACHE) пустой, Redis — нет.
+    # Без прогрева первые N уникальных вопросов делают async round-trip к Redis
+    # вместо мгновенного ответа из памяти (~0.5 мс vs ~0 мс, + await overhead).
+    #
+    # Проблема: ключ в памяти — (text, lang), а в Redis — caiu:trans:{lang}:{md5}.
+    # Мы не знаем оригинальный text из MD5. Поэтому используем вспомогательный
+    # словарь _TRANSLATION_WARMUP_CACHE (redis_key → value), который проверяется
+    # в translate_to_russian ПОСЛЕ вычисления redis_key.
+    try:
+        r_warm = await _get_async_redis()
+        if r_warm:
+            warm_count = 0
+            async for rk in r_warm.scan_iter(f"{_REDIS_TRANS_PREFIX}*"):
+                val = await r_warm.get(rk)
+                if val and warm_count < _TRANSLATION_CACHE_MAX:
+                    _TRANSLATION_WARMUP_CACHE[rk] = val
+                    warm_count += 1
+            if warm_count:
+                logger.info(f"[TransCache] Warmed {warm_count} translations from Redis")
+    except Exception as e:
+        logger.warning(f"[TransCache] Warmup failed (non-critical): {e}")
+
+    # Фоновая очистка in-memory словарей — раз в _MEMORY_CLEANUP_INTERVAL сек.
+    # Без этого _user_timestamps и _greeted_users растут навсегда, по ~200 байт
+    # на каждого когда-либо писавшего пользователя.
+    cleanup_task = asyncio.create_task(_memory_cleanup_loop())
 
     async def on_shutdown():
         global _rag_client
+        cleanup_task.cancel()
         if _rag_client and not _rag_client.is_closed:
             await _rag_client.aclose()
             logger.info("httpx RAG client closed")
+        # Закрываем FSM Redis (если использовался) — иначе при следующем
+        # рестарте может остаться зависшее TCP-соединение.
+        try:
+            close = getattr(fsm_storage, "close", None)
+            if close:
+                res = close()
+                if asyncio.iscoroutine(res):
+                    await res
+        except Exception:
+            pass
 
     dp.shutdown.register(on_shutdown)
     logger.info("Бот запущен")

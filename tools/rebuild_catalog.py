@@ -22,27 +22,33 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rag_service"))
 
 from app.logging_setup import setup_logging
-setup_logging("catalog")
-
 from app.indexer.storage import ensure_collection_exists, get_collection_stats
 from app.indexer.catalog_builder import build_and_save_catalog_chunks
 
-print("=" * 60)
-print("REBUILD CATALOG CHUNKS")
-print("Факультеты + Специальности → Qdrant")
-print("=" * 60)
 
-# Убеждаемся что коллекция существует
-ensure_collection_exists()
+def main():
+    setup_logging("catalog")
 
-stats_before = get_collection_stats()
-print(f"\nЗаписей в Qdrant до: {stats_before['total_chunks']}")
+    print("=" * 60)
+    print("REBUILD CATALOG CHUNKS")
+    print("Факультеты + Специальности → Qdrant")
+    print("=" * 60)
 
-# Строим каталог-чанки
-total = build_and_save_catalog_chunks()
+    # Убеждаемся что коллекция существует
+    ensure_collection_exists()
 
-stats_after = get_collection_stats()
-print(f"\nЗаписей в Qdrant после: {stats_after['total_chunks']}")
-print(f"Добавлено каталог-векторов: {total}")
-print("\n[OK] Перезапустите бот и RAG-сервис для применения изменений.")
-print("     (изменения в search.py применяются сразу без перезапуска Qdrant)")
+    stats_before = get_collection_stats()
+    print(f"\nЗаписей в Qdrant до: {stats_before['total_chunks']}")
+
+    # Строим каталог-чанки
+    total = build_and_save_catalog_chunks()
+
+    stats_after = get_collection_stats()
+    print(f"\nЗаписей в Qdrant после: {stats_after['total_chunks']}")
+    print(f"Добавлено каталог-векторов: {total}")
+    print("\n[OK] Перезапустите бот и RAG-сервис для применения изменений.")
+    print("     (изменения в search.py применяются сразу без перезапуска Qdrant)")
+
+
+if __name__ == "__main__":
+    main()

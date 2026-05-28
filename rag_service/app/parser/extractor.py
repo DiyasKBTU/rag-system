@@ -13,6 +13,7 @@ Key improvements over original:
   - Better fallback: tries body text when all else fails
 """
 
+import logging
 import re
 import hashlib
 import httpx
@@ -21,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # Домены которые считаем ценными внешними ресурсами (документы, файлы).
@@ -93,14 +96,14 @@ def download_page(url: str) -> Optional[str]:
         if response.status_code == 200:
             return response.text
         else:
-            print(f"  [!] HTTP {response.status_code}: {url}")
+            logger.warning(f"[Extractor] HTTP {response.status_code}: {url}")
             return None
 
     except httpx.TimeoutException:
-        print(f"  [!] Timeout: {url}")
+        logger.warning(f"[Extractor] Timeout: {url}")
         return None
     except Exception as e:
-        print(f"  [!] Download error {url}: {e}")
+        logger.error(f"[Extractor] Download error {url}: {e}")
         return None
 
 
@@ -581,7 +584,7 @@ def get_page_content(url: str) -> Optional[PageContent]:
     # Accept pages with very little text — they still deserve to be indexed.
     # Even a page title alone is useful for search.
     if len(content.text) < 10:
-        print(f"  [!] Too little text ({len(content.text)} chars), skipping: {url}")
+        logger.warning(f"[Extractor] Too little text ({len(content.text)} chars), skipping: {url}")
         return None
 
     return content

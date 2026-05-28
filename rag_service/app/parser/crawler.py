@@ -84,11 +84,37 @@ def preview_urls() -> List[SitemapURL]:
     return urls
 
 
-def _fetch_sitemap(sitemap_url: str) -> List[SitemapURL]:
+def _fetch_sitemap(
+    sitemap_url: str,
+    _seen: Optional[set] = None,
+    _depth: int = 0,
+) -> List[SitemapURL]:
     """
     Download and parse sitemap.xml.
     Handles both regular sitemap and sitemap_index (which links to other sitemaps).
+
+    _seen:  set of already-visited sitemap URLs — prevents infinite loops
+            when a sitemap_index accidentally references itself or a cycle.
+    _depth: current recursion depth — hard limit of 5 prevents runaway recursion
+            even if _seen somehow misses a cycle (e.g. redirect normalisation).
     """
+    _MAX_DEPTH = 5
+
+    if _seen is None:
+        _seen = set()
+
+    if sitemap_url in _seen:
+        logger.warning(f"[Crawler] Sitemap cycle detected, skipping: {sitemap_url}")
+        return []
+
+    if _depth > _MAX_DEPTH:
+        logger.warning(
+            f"[Crawler] Max recursion depth ({_MAX_DEPTH}) reached, skipping: {sitemap_url}"
+        )
+        return []
+
+    _seen.add(sitemap_url)
+
     html = _download_xml(sitemap_url)
     if not html:
         return []
@@ -105,7 +131,7 @@ def _fetch_sitemap(sitemap_url: str) -> List[SitemapURL]:
             if loc:
                 child_url = loc.text.strip()
                 logger.debug(f"[Crawler] Reading child sitemap: {child_url}")
-                child_urls = _fetch_sitemap(child_url)
+                child_urls = _fetch_sitemap(child_url, _seen=_seen, _depth=_depth + 1)
                 all_urls.extend(child_urls)
                 time.sleep(0.5)
         return all_urls

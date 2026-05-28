@@ -51,7 +51,7 @@ from app.config import settings
 from app.indexer.storage import (
     get_client,
     get_active_collection,
-    _set_active_collection,
+    set_active_collection,
     ensure_collection_exists,
     get_collection_stats,
 )
@@ -183,7 +183,7 @@ def _first_migration(shadow_collection: str) -> None:
                 )
             ]
         )
-        _set_active_collection(shadow_collection)
+        set_active_collection(shadow_collection)
         logger.info(f"[HotSwap] Alias '{original}' → '{shadow_collection}' created")
 
     except Exception as e:
@@ -222,7 +222,7 @@ def _atomic_swap(shadow_collection: str) -> None:
                 ),
             ]
         )
-        _set_active_collection(shadow_collection)
+        set_active_collection(shadow_collection)
         logger.info(f"[HotSwap] Alias now points to '{shadow_collection}'")
 
         # Удаляем старую коллекцию чтобы не тратить место
@@ -374,6 +374,27 @@ def run_shadow_indexing() -> dict:
         result["swap_type"]       = "atomic" if is_alias else "first_migration"
         result["snapshot_points"] = snapshot_points
         _last_result = result
+
+        # ── Инвалидируем поисковый Redis-кеш ─────────────────────
+        # После свопа алиас уже указывает на новую коллекцию, но ключи
+        # "caiu:search:*" в Redis ещё хранят результаты из СТАРОГО индекса.
+        # Без инвалидации пользователи до 1 часа получают устаревшие данные.
+        # Сканируем и удаляем пачками (scan_iter безопасен при большом объёме).
+        try:
+            from app.redis_client import get_redis
+            r = get_redis()
+            if r is not None:
+                from app.retrieval.search import _REDIS_SEARCH_PREFIX
+                keys = list(r.scan_iter(f"{_REDIS_SEARCH_PREFIX}*"))
+                if keys:
+                    # delete принимает *args — передаём список как *keys
+                    r.delete(*keys)
+                    logger.info(f"[HotSwap] Search cache invalidated: {len(keys)} keys deleted")
+                else:
+                    logger.info("[HotSwap] Search cache was empty, nothing to invalidate")
+        except Exception as e:
+            # Не критично: кеш протухнет сам через TTL (1 час)
+            logger.warning(f"[HotSwap] Search cache flush failed (non-critical): {e}")
 
         logger.info(f"[HotSwap] Complete. New active collection: '{shadow}'")
         return result

@@ -74,6 +74,7 @@ def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
 
     Returns:
         List of vectors, same order as input texts.
+        Empty/whitespace-only texts get a zero-vector (1536 floats).
     """
     if not texts:
         return []
@@ -81,11 +82,23 @@ def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
     # Truncate texts that are too long
     texts = [t[:MAX_CHARS_PER_CHUNK] for t in texts]
 
-    all_vectors = []
-    total_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
+    # OpenAI returns HTTP 400 for empty/whitespace strings.
+    # We replace them with a placeholder so the batch request succeeds,
+    # then overwrite their slots with zero-vectors in the output.
+    _PLACEHOLDER = "empty"
+    empty_indices = {i for i, t in enumerate(texts) if not t.strip()}
+    safe_texts = [_PLACEHOLDER if i in empty_indices else t for i, t in enumerate(texts)]
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch     = texts[i: i + BATCH_SIZE]
+    if empty_indices:
+        logger.warning(
+            f"[Embeddings] {len(empty_indices)} empty text(s) replaced with zero-vectors"
+        )
+
+    all_vectors = []
+    total_batches = (len(safe_texts) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for i in range(0, len(safe_texts), BATCH_SIZE):
+        batch     = safe_texts[i: i + BATCH_SIZE]
         batch_num = i // BATCH_SIZE + 1
 
         logger.info(f"[Embeddings] Batch {batch_num}/{total_batches} ({len(batch)} texts)...")
@@ -94,8 +107,13 @@ def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
         all_vectors.extend(batch_vectors)
 
         # Small pause between batches to avoid rate limits
-        if i + BATCH_SIZE < len(texts):
+        if i + BATCH_SIZE < len(safe_texts):
             time.sleep(0.5)
+
+    # Overwrite placeholder vectors with zero-vectors
+    zero_vector: List[float] = [0.0] * 1536
+    for idx in empty_indices:
+        all_vectors[idx] = zero_vector
 
     return all_vectors
 
@@ -115,25 +133,3 @@ def _get_batch_with_retry(texts: List[str]) -> List[List[float]]:
     # Sort by index to guarantee input order is preserved
     sorted_data = sorted(response.data, key=lambda x: x.index)
     return [item.embedding for item in sorted_data]
-
-
-def estimate_cost(num_chunks: int, avg_chars_per_chunk: int = 2000) -> float:
-    """
-    Estimate cost of indexing N chunks.
-
-    Args:
-        num_chunks:           Number of text chunks
-        avg_chars_per_chunk:  Average chars per chunk
-
-    Returns:
-        Estimated cost in USD
-
-    Example:
-        cost = estimate_cost(100, 2000)
-        # cost ≈ 0.001 (less than 0.1 cent)
-    """
-    # Approximate: 1 token ≈ 4 chars for mixed Russian/English text
-    avg_tokens   = avg_chars_per_chunk / 4
-    total_tokens = num_chunks * avg_tokens
-    # text-embedding-3-small: $0.02 per 1M tokens
-    return (total_tokens / 1_000_000) * 0.02

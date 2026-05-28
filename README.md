@@ -113,12 +113,16 @@ python -m app.parser
 ```bash
 # Терминал 1:
 cd rag_service && python run_api.py
-# → Uvicorn running on http://0.0.0.0:8001
+# → Uvicorn running on http://127.0.0.1:8001
 
 # Другой терминал:
 curl http://localhost:8001/health
 # → {"status": "ok", ...}
 ```
+
+> RAG-сервис слушает только `127.0.0.1` — он вызывается только локальным ботом
+> с той же машины. Если нужно сделать его доступным снаружи (не рекомендуется без
+> firewall), измените `host` в `rag_service/run_api.py`.
 
 ---
 
@@ -555,6 +559,12 @@ cd rag_service && python -m app.parser
 **Можно ли запустить без интернета?**
 Нет. Система требует интернет для обращений к OpenAI API (поиск и генерация ответов) и скачивания страниц сайта (только при индексации). База Qdrant работает локально.
 
+**После рестарта бот «забывает» с кем разговаривал — пользователи попадают в стартовое меню**
+Раньше состояние FSM (выбранный язык, история диалога) хранилось только в памяти процесса и сбрасывалось при рестарте. Сейчас бот пытается использовать Redis для FSM-storage (DB=1). Если Redis работает — состояние переживает рестарт. Если Redis недоступен — есть автоматический fallback на `MemoryStorage`, в логе появится предупреждение `FSM storage: Redis недоступен ... — fallback на MemoryStorage`. Проверь что Docker запущен: `docker ps`.
+
+**Растёт ли память бота со временем?**
+Нет. Бот хранит в памяти rate-limit и список «уже здоровались» — мёртвые записи чистятся фоновой задачей раз в 10 минут (TTL для greeted-users — 24 часа). В логе видны строки `[Cleanup] Removed ...`.
+
 ---
 
 ---
@@ -568,22 +578,32 @@ cd rag_service && python -m app.parser
         │
         ▼
   bot/run.py                         ← aiogram 3.x
+  ├── FSM-storage: Redis DB=1 (fallback → MemoryStorage)
+  ├── Rate limiter (10 сообщений / 60 сек на пользователя)
   ├── Определение языка (ru/kk/en)
   ├── Перевод на русский (если нужно) → OpenAI GPT-4.1-mini
-  │   └── кеш: in-memory + Redis TTL 30 дней
+  │   └── кеш: in-memory LRU 500 + Redis DB=0 TTL 30 дней
   ├── Запрос контекста (httpx POST /search)
-  │   └── retry: 3 попытки, backoff 1/2/4 сек
+  │   ├── pool: max_connections=30, keep-alive=10
+  │   ├── timeout: connect=5 / read=25 / write=5
+  │   └── retry: 3 попытки, backoff 1/2/4 сек, ConnectError → pересоздание под Lock
   ├── Формирование системного промпта (персонаж Айданы)
   └── Streaming-ответ → OpenAI GPT-4.1-mini → Telegram (edit placeholder)
+      └── timeout: connect=5 / read=45 / write=10, max_retries=2
 
-        │ POST /search  (X-API-Key: secret)
+        │ POST /search  (X-API-Key, constant-time сравнение)
         ▼
-  rag_service/run_api.py             ← FastAPI, порт 8001
+  rag_service/run_api.py             ← FastAPI, host=127.0.0.1, порт 8001
+  ├── asyncio.Semaphore(20) — лимит параллельных вызовов OpenAI
+  ├── ThreadPoolExecutor(32) — пул для asyncio.to_thread
+  ├── Scheduler-loop (раз в 30 сек) → горячая переиндексация по расписанию
   └── app/retrieval/search.py
+      ├── Redis search cache (1 час) — повторяющиеся вопросы возвращаются без OpenAI
       ├── Расширение запроса (SYNONYM_MAP + rapidfuzz)
       ├── Embedding (OpenAI text-embedding-3-small, 1536 dim)
-      │   └── кеш: in-memory (512 слотов) + Redis TTL 30 дней
+      │   └── кеш: in-memory (512 слотов) + Redis DB=0 TTL 30 дней
       ├── Qdrant cosine search через alias
+      │   └── ping кешируется 30 сек, переподключение при сбое
       ├── Фильтр уверенности (score ≥ 0.28)
       ├── Фильтр хвоста (score ≥ best - 0.25)
       ├── Дедупликация (max 2 чанка с одной страницы)
@@ -614,13 +634,26 @@ cd rag_service && python -m app.parser
 crawler.get_urls_for_indexing()
     │  sitemap.xml → ~200 URL с фильтрацией
     │  Исключаются: /kz/ страницы, новости, pagination, lang= параметры
+    │  Годовые архивы (/2019/.../<next_year>/) — генерируются автоматически
+    │
+    ▼
+lastmod-фильтрация
+    │  Если в sitemap есть <lastmod> и страница не менялась с last_indexed_at
+    │  (из hot_swap_state.json) — пропускаем ещё ДО скачивания
+    │  Это первый барьер; второй — content_hash после скачивания
+    │
+    ▼
+параллельное скачивание (5 воркеров, ~0.3 сек delay/воркер)
+    │  Результат пишется в fetch_cache.pkl
+    │  Resume: при обрыве сети повторный запуск пропускает уже скачанное
     │
     ▼
 extractor.get_page_content(url)
-    │  requests + BeautifulSoup
+    │  httpx + BeautifulSoup
     │  Удаляется: навигация, футер, скрипты, форм-блоки
     │  h2/h3/h4 теги → маркеры "## Заголовок" в тексте
-    │  Результат: PageContent(text, title, url, content_hash)
+    │  external_links — ценные ссылки Google Docs/PDF на странице
+    │  Результат: PageContent(text, title, url, content_hash, external_links)
     │  content_hash = md5(clean_text) — для определения изменений
     │
     ▼
@@ -628,6 +661,11 @@ page_needs_update(url, hash, collection_name)
     │  Ищет в Qdrant чанки с этим page_url
     │  Сравнивает content_hash → если совпадает, страница пропускается
     │  Если не совпадает или страницы нет — продолжаем
+    │
+    ▼
+url_is_manually_edited(url)
+    │  Если ВСЕ чанки URL имеют флаг manually_edited=True — пропускаем
+    │  Защита ручных правок из chunk_editor от автоиндексации
     │
     ▼
 chunker.split_into_chunks(text, page_url, page_title)
@@ -639,8 +677,9 @@ chunker.split_into_chunks(text, page_url, page_title)
     │
     ▼
 question_generator.generate_question_chunks(chunks)
-    │  Для каждого TextChunk — параллельные запросы к GPT (5 одновременно)
+    │  Для каждого TextChunk — параллельные запросы к GPT (BATCH_CONCURRENCY=10)
     │  Промпт: "Сгенерируй 4 вопроса на русском, на которые отвечает этот текст"
+    │  Язык вопросов определяется автоматически (ru/kk)
     │  Каждый вопрос сохраняется как отдельный TextChunk:
     │    embed_text = "вопрос" (векторизуется)
     │    text = оригинальный текст чанка (возвращается при поиске)
@@ -671,7 +710,21 @@ Qdrant: ~2000 записей
 ## Пайплайн поиска
 
 ```
-POST /search {"query": "какие документы нужны для поступления", "lang": "ru"}
+POST /search {"question": "какие документы нужны для поступления"}
+    │
+    ▼
+семафор (max 20 одновременно) → asyncio.to_thread(search, ...)
+    │  Перегрузка: ожидание >20 сек → HTTP 503
+    │
+    ▼
+Redis search cache (TTL 1 час)
+    │  Ключ: "caiu:search:{md5(normalized_question)}"
+    │  Cache hit → возврат без OpenAI и без Qdrant (< 5 мс)
+    │
+    ▼
+_is_list_query(question) → catalog mode?
+    │  Если в вопросе слова "специальности/факультеты/перечень" — расширяем:
+    │    top_k=25, max_chunks=15, max_per_page=5, qdrant_threshold=0.15
     │
     ▼
 _expand_query(query)
@@ -809,13 +862,14 @@ Qdrant алиас:
 Казахский/английский текст
     │
     ▼ Level 1: in-memory OrderedDict (_TRANSLATION_CACHE)
-    │  Ключ: (lang, text)
-    │  Размер: 1000 слотов (LRU)
+    │  Ключ: (text, lang)
+    │  Размер: 500 слотов (LRU)
     │
-    ▼ Level 2: Redis (async клиент, redis.asyncio)
+    ▼ Level 2: Redis (async клиент, redis.asyncio, DB=0)
     │  Ключ: "caiu:trans:{lang}:{md5(text)}"
     │  TTL: 30 дней
     │  Graceful fail: Redis недоступен → только in-memory
+    │  Инициализация под asyncio.Lock (защита от двойного создания клиента)
     │
     ▼ OpenAI GPT (только при cache miss)
     │
@@ -870,16 +924,18 @@ Qdrant алиас:
     "vector":       [0.023, -0.14, ..., 0.087],  # 1536 float32
 
     "payload": {
-        "text":          "оригинальный текст чанка",   # возвращается в GPT-контекст
-        "page_url":      "https://caiu.edu.kz/...",
-        "page_title":    "Название страницы",
-        "section_title": "Название раздела h2/h3",
-        "chunk_index":   0,              # порядковый номер чанка на странице
-        "content_hash":  "md5-hex",      # для проверки изменений при переиндексации
-        "embed_text":    "",             # пустая строка = обычный чанк
+        "text":           "оригинальный текст чанка",   # возвращается в GPT-контекст
+        "page_url":       "https://caiu.edu.kz/...",
+        "page_title":     "Название страницы",
+        "section_title":  "Название раздела h2/h3",
+        "chunk_index":    0,             # порядковый номер чанка на странице
+        "content_hash":   "md5-hex",     # для проверки изменений при переиндексации
+        "embed_text":     "",            # пустая строка = обычный чанк
                                          # непустая = вопрос-чанк (vector вычислен из этого текста)
-        "tags":          ["admission"],  # для ручных чанков из JSON
+        "external_links": [],            # ссылки на Google Docs/PDF найденные на странице
+        "tags":           ["admission"], # для ручных чанков из JSON
         "manually_edited": false,        # true = редактировался в chunk_editor
+        "is_catalog_chunk": false,       # true = синтетический каталог/manual_knowledge
     }
 }
 ```
@@ -909,9 +965,11 @@ Qdrant алиас:
 |---|---|---|
 | `TOP_K_RESULTS` | 8 | Сколько брать из Qdrant до фильтрации |
 | `MAX_CONTEXT_CHUNKS` | 5 | Сколько отдавать в GPT |
+| `MAX_CONTEXT_CHARS` | 6000 | Лимит длины контекста (для каталог-режима ×2) |
 | `MIN_CONFIDENT_SCORE` | 0.28 | Ниже — "нет информации" |
+| `SIMILARITY_THRESHOLD` | 0.28 | Минимальный порог Qdrant `score_threshold` |
 | `SCORE_GAP_THRESHOLD` | 0.25 | Отсекаем хвост (score < best - 0.25) |
-| `MAX_CHUNKS_PER_PAGE` | 2 | Максимум чанков с одной страницы |
+| max chunks per page | 2 | Хардкод в `search.py`, в каталог-режиме = 5 |
 
 ### Модели OpenAI
 
@@ -936,15 +994,39 @@ Qdrant алиас:
 | Кеш | Тип | Размер / TTL |
 |---|---|---|
 | Эмбеддинги in-memory | LRU dict | 512 слотов |
-| Эмбеддинги Redis | bytes (struct float32) | TTL 30 дней |
-| Переводы in-memory | OrderedDict | 1000 слотов |
-| Переводы Redis | UTF-8 строки | TTL 30 дней |
+| Эмбеддинги Redis (DB=0) | bytes (struct float32) | TTL 30 дней |
+| Переводы in-memory | OrderedDict (LRU) | 500 слотов |
+| Переводы Redis (DB=0) | UTF-8 строки | TTL 30 дней |
+| Результаты поиска Redis (DB=0) | JSON | TTL 1 час |
+| Qdrant ping (in-process) | timestamp | 30 сек |
+| `hot_swap_state.json` (in-process) | string | 5 сек |
 
-### Timeout и retry (`bot/run.py`)
+### Конкурентность и пулы
+
+| Что | Где | Значение |
+|---|---|---|
+| Семафор параллельных поисков | `rag_service/app/main.py` | 20 одновременно (timeout 20 сек → 503) |
+| ThreadPoolExecutor | `rag_service/app/main.py` lifespan | 32 потока |
+| Параллельных запросов бота к RAG | `bot/run.py` httpx Limits | max_connections=30, keep-alive=10 |
+| Параллельных GPT при индексации (вопросы) | `question_generator.py` | semaphore=10 |
+| Параллельных воркеров скачивания | `pipeline.py` | 5 потоков, 0.3 сек delay/воркер |
+
+### Timeout и retry (бот)
+
+| Назначение | Параметр | Значение |
+|---|---|---|
+| RAG-клиент (httpx) | connect / read / write / pool | 5 / 25 / 5 / 5 сек |
+| RAG-клиент | Кол-во попыток | 3, backoff 1→2→4 сек |
+| OpenAI клиент | connect / read / write / pool | 5 / 45 / 10 / 5 сек |
+| OpenAI клиент | max_retries | 2 |
+| Telegram стриминг | первое редактирование | после 80 символов |
+| Telegram стриминг | интервал между правками | 1.1 сек |
+
+### Антиспам и автоочистка (`bot/run.py`)
 
 | Параметр | Значение |
 |---|---|
-| connect timeout | 5 сек |
-| read timeout | 25 сек |
-| Количество попыток | 3 |
-| Backoff | 1с → 2с → 4с |
+| Лимит сообщений на пользователя | 10 шт / 60 сек |
+| Кулдаун после превышения | 30 сек |
+| TTL «уже здоровались» | 24 часа |
+| Интервал фоновой очистки in-memory | 600 сек (10 минут) |

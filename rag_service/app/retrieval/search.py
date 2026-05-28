@@ -22,6 +22,7 @@ import hashlib
 import logging
 import threading
 import dataclasses
+from collections import OrderedDict
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 
@@ -37,10 +38,12 @@ logger = logging.getLogger(__name__)
 
 # ── Двухуровневый кэш эмбеддингов ────────────────────────────────────────────
 #
-# Уровень 1 — in-memory (dict):
+# Уровень 1 — in-memory (OrderedDict, LRU):
 #   • Мгновенный доступ (<1мс)
 #   • Теряется при рестарте RAG-сервиса
 #   • maxsize=512 запросов
+#   • LRU-вытеснение: при hit'е ключ перемещается в конец → вытесняются
+#     самые ДАВНО используемые, а не самые ранние по вставке (FIFO).
 #
 # Уровень 2 — Redis:
 #   • ~1-2мс доступ (localhost)
@@ -50,7 +53,7 @@ logger = logging.getLogger(__name__)
 #
 # ВАЖНО: FastAPI sync endpoint работает в threadpool → Lock обязателен.
 #
-_EMBEDDING_CACHE: Dict[str, List[float]] = {}
+_EMBEDDING_CACHE: OrderedDict = OrderedDict()
 _CACHE_MAX_SIZE = 512
 _CACHE_LOCK = threading.Lock()
 
@@ -122,14 +125,24 @@ def _redis_set_vector(key: str, vector: List[float]) -> None:
 
 
 def _cache_put(key: str, vector: List[float]) -> None:
-    """Записывает вектор в in-memory кеш (thread-safe, с eviction)."""
+    """
+    Записывает вектор в in-memory LRU-кеш (thread-safe, с eviction).
+
+    LRU-логика через OrderedDict:
+    - Новый ключ добавляется в конец (move_to_end по умолчанию)
+    - Существующий ключ перемещается в конец (обновление = «использование»)
+    - При переполнении вытесняется первый (самый давно НЕиспользуемый) ключ
+    """
     with _CACHE_LOCK:
-        if len(_EMBEDDING_CACHE) >= _CACHE_MAX_SIZE:
-            try:
-                _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
-            except StopIteration:
-                pass
+        if key in _EMBEDDING_CACHE:
+            # LRU: при повторной записи обновляем позицию
+            _EMBEDDING_CACHE.move_to_end(key)
+            _EMBEDDING_CACHE[key] = vector
+            return
         _EMBEDDING_CACHE[key] = vector
+        _EMBEDDING_CACHE.move_to_end(key)
+        while len(_EMBEDDING_CACHE) > _CACHE_MAX_SIZE:
+            _EMBEDDING_CACHE.popitem(last=False)  # удаляем самый давно неиспользуемый
 
 
 def _get_embedding_cached(text: str) -> List[float]:
@@ -139,9 +152,10 @@ def _get_embedding_cached(text: str) -> List[float]:
     """
     key = hashlib.md5(text.encode()).hexdigest()
 
-    # Уровень 1: in-memory
+    # Уровень 1: in-memory (LRU — при hit'е перемещаем в конец)
     with _CACHE_LOCK:
         if key in _EMBEDDING_CACHE:
+            _EMBEDDING_CACHE.move_to_end(key)
             return _EMBEDDING_CACHE[key]
 
     # Уровень 2: Redis
@@ -170,9 +184,13 @@ def _get_embeddings_batch_cached(texts: List[str]) -> List[List[float]]:
     """
     keys = [hashlib.md5(t.encode()).hexdigest() for t in texts]
 
-    # ── Уровень 1: in-memory ──────────────────────────────────────
+    # ── Уровень 1: in-memory (LRU — при hit'е обновляем позиции) ──
     with _CACHE_LOCK:
-        cached = {k: _EMBEDDING_CACHE[k] for k in keys if k in _EMBEDDING_CACHE}
+        cached = {}
+        for k in keys:
+            if k in _EMBEDDING_CACHE:
+                _EMBEDDING_CACHE.move_to_end(k)
+                cached[k] = _EMBEDDING_CACHE[k]
 
     # ── Уровень 2: Redis (для промахов in-memory) ─────────────────
     still_missing = [i for i, k in enumerate(keys) if k not in cached]

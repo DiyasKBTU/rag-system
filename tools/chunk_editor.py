@@ -322,7 +322,7 @@ class IndexPageRequest(BaseModel):
 async def auth_login(req: AuthLoginRequest, response: Response):
     if not CHUNK_EDITOR_PASSWORD:
         return {"ok": True, "message": "Аутентификация отключена"}
-    if req.password != CHUNK_EDITOR_PASSWORD:
+    if not secrets.compare_digest(req.password, CHUNK_EDITOR_PASSWORD):
         raise HTTPException(status_code=403, detail="Неверный пароль")
     token = secrets.token_hex(32)
     _sessions.add(token)

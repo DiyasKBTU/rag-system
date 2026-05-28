@@ -160,19 +160,6 @@ def _extract_op_lines(text: str) -> List[str]:
     return ops
 
 
-def _filter_russian_lines(text: str, max_chars: int = 6000) -> str:
-    """Убирает казахские строки из текста, оставляет русские и латинские."""
-    lines = []
-    total = 0
-    for line in text.split("\n"):
-        if not _is_kazakh(line):
-            lines.append(line)
-            total += len(line)
-            if total >= max_chars:
-                break
-    return "\n".join(lines)
-
-
 def _save_synthetic_chunk(
     virtual_url: str,
     page_title: str,
@@ -450,7 +437,7 @@ def build_departments_catalog(
         "кафедра права экономики педагогики",
         "кафедра туризм спорт музыка",
         "departments CAIU programs",
-        "каферадар тізімі ЦАИУ",
+        "кафедралар тізімі ЦАИУ",
     ]
 
     summary_saved = _save_synthetic_chunk(

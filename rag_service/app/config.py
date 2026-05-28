@@ -12,10 +12,26 @@ config.py — Все настройки RAG-сервиса в одном мес�
 - API_SECRET_KEY — любая секретная строка (придумайте сами)
 """
 
+from datetime import datetime
+
+from pydantic import Field
 from pydantic_settings import BaseSettings
 from typing import List
 from pathlib import Path
 from dotenv import load_dotenv
+
+
+def _year_exclude_patterns() -> List[str]:
+    """
+    Возвращает паттерны вида '/YYYY/' для исключения новостных URL по годам.
+
+    Покрывает диапазон от 2019 до (текущий год + 1) — следующий год добавляется
+    автоматически, чтобы в декабре не пришлось править config.py перед Новым годом.
+    Раньше годы были хардкодом — приходилось добавлять `/2027/`, `/2028/` руками,
+    про что легко забыть.
+    """
+    next_year = datetime.now().year + 1
+    return [f"/{year}/" for year in range(2019, next_year + 1)]
 
 # Путь к папке rag_service (где находится .env)
 # __file__ = rag_service/app/config.py
@@ -75,8 +91,10 @@ class Settings(BaseSettings):
 
     # ─── ПАРСИНГ — ФИЛЬТРАЦИЯ URL ─────────────────────────────
     # Паттерны URL которые НЕ нужно индексировать
-    # Если URL содержит любой из этих фрагментов — пропускаем
-    EXCLUDE_URL_PATTERNS: List[str] = [
+    # Если URL содержит любой из этих фрагментов — пропускаем.
+    # Используем Field(default_factory=...) чтобы годы вычислялись динамически
+    # при старте сервиса (см. _year_exclude_patterns выше).
+    EXCLUDE_URL_PATTERNS: List[str] = Field(default_factory=lambda: [
         # ─── Языки и версии ───────────────────────────
         "/en/",           # Английская версия — не индексируем
         "/kz/",           # Казахская версия (старый префикс) — не используется на сайте
@@ -106,15 +124,11 @@ class Settings(BaseSettings):
         "/press",         # Пресс-центр
         "/announcements",  # Объявления
         "/events",        # События/мероприятия
-        "/calendar",
-        "/2026/",
-        "/2025/",  # Календарь событий
-        "/2024/",         # Новости по годам (любой год)
-        "/2023/",
-        "/2022/",
-        "/2021/",
-        "/2020/",
-        "/2019/",
+        "/calendar",      # Календарь событий
+
+        # Годовые архивы: 2019…следующий_год — генерятся автоматически
+        # _year_exclude_patterns() = ["/2019/", "/2020/", ..., "/<next>/"]
+        *_year_exclude_patterns(),
 
         # ─── Внутренние/сотрудники (НЕ для абитуриентов) ──
         "/staff",         # Сотрудники
@@ -133,7 +147,7 @@ class Settings(BaseSettings):
         "/jobs",          # Работа
         "/subscribe",     # Подписка
         "/checkout",      # Оплата
-    ]
+    ])
 
     # ─── GOOGLE DOCS ──────────────────────────────────────────────────────
     # Один документ — читается из .env (совместимо с Django настройками).
